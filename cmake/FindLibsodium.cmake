@@ -1,0 +1,7 @@
+find_path(LIBSODIUM_INCLUDE_DIR NAMES sodium.h)
+find_library(LIBSODIUM_LIBRARY NAMES sodium libsodium)
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(Libsodium DEFAULT_MSG LIBSODIUM_LIBRARY LIBSODIUM_INCLUDE_DIR)
+set(LIBSODIUM_LIBRARIES    ${LIBSODIUM_LIBRARY})
+set(LIBSODIUM_INCLUDE_DIRS ${LIBSODIUM_INCLUDE_DIR})
+mark_as_advanced(LIBSODIUM_INCLUDE_DIR LIBSODIUM_LIBRARY)

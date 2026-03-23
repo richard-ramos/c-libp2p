@@ -1,0 +1,26 @@
+syntax = "proto2";
+
+package noise;
+
+message NoiseHandshakePayload {
+    optional bytes identity_key = 1;    // protobuf-encoded PublicKey
+    optional bytes identity_sig = 2;    // sig over "noise-libp2p-static-key:" + static_pubkey
+    optional NoiseExtensions extensions = 4;
+}
+
+message NoiseExtensions {
+    repeated bytes  webtransport_certhashes = 1;
+    repeated string stream_muxers          = 2;
+}
+
+message PublicKey {
+    required KeyType Type = 1;
+    required bytes   Data = 2;
+}
+
+enum KeyType {
+    RSA       = 0;
+    Ed25519   = 1;
+    Secp256k1 = 2;
+    ECDSA     = 3;
+}

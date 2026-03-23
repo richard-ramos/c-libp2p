@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  go-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.go-libp2p
+    container_name: go-libp2p-node
+    networks:
+      - libp2p-interop
+    ports:
+      - "4001:4001"
+
+  c-node:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: c-libp2p-node
+    depends_on:
+      - go-node
+    networks:
+      - libp2p-interop
+
+networks:
+  libp2p-interop:
+    driver: bridge

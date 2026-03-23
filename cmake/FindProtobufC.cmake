@@ -1,0 +1,7 @@
+find_path(PROTOBUFC_INCLUDE_DIR NAMES protobuf-c/protobuf-c.h)
+find_library(PROTOBUFC_LIBRARY NAMES protobuf-c)
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(ProtobufC DEFAULT_MSG PROTOBUFC_LIBRARY PROTOBUFC_INCLUDE_DIR)
+set(PROTOBUFC_LIBRARIES    ${PROTOBUFC_LIBRARY})
+set(PROTOBUFC_INCLUDE_DIRS ${PROTOBUFC_INCLUDE_DIR})
+mark_as_advanced(PROTOBUFC_INCLUDE_DIR PROTOBUFC_LIBRARY)

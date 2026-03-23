@@ -1,0 +1,12 @@
+syntax = "proto2";
+
+package identify;
+
+message Identify {
+    optional bytes  publicKey       = 1;  // protobuf-encoded PublicKey
+    repeated bytes  listenAddrs     = 2;  // multiaddr bytes
+    repeated string protocols       = 3;  // supported protocol IDs
+    optional bytes  observedAddr    = 4;  // remote's address as seen by us
+    optional string protocolVersion = 5;  // e.g. "ipfs/0.1.0"
+    optional string agentVersion    = 6;  // e.g. "c-libp2p/0.1.0"
+}

@@ -1,0 +1,88 @@
+FROM golang:1.22-alpine AS builder
+
+RUN apk add --no-cache git
+
+WORKDIR /app
+
+# Initialize Go module and install go-libp2p v0.36.x
+RUN go mod init go-libp2p-interop && \
+    go get github.com/libp2p/go-libp2p@v0.36.5 && \
+    go get github.com/libp2p/go-libp2p/p2p/protocol/ping@v0.36.5
+
+# Write the Go interop node
+RUN cat > main.go <<'GOEOF'
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+)
+
+const echoProto = "/echo/1.0.0"
+
+func echoHandler(s network.Stream) {
+	defer s.Close()
+	_, err := io.Copy(s, s)
+	if err != nil && err != io.EOF {
+		log.Printf("echo handler error: %v", err)
+	}
+}
+
+func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create a libp2p host listening on TCP (all interfaces, port 4001)
+	host, err := libp2p.New(
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/4001",
+			"/ip6/::/tcp/4001",
+		),
+	)
+	if err != nil {
+		log.Fatalf("Failed to create host: %v", err)
+	}
+	defer host.Close()
+
+	// Register the ping service (go-libp2p uses /ipfs/ping/1.0.0)
+	pingService := ping.NewPingService(host)
+	_ = pingService
+
+	// Register the echo protocol
+	host.SetStreamHandler(echoProto, echoHandler)
+
+	// Print peer ID and listen addresses
+	fmt.Printf("GO_PEER_ID=%s\n", host.ID().String())
+	for _, addr := range host.Addrs() {
+		fmt.Printf("GO_LISTEN_ADDR=%s/p2p/%s\n", addr.String(), host.ID().String())
+	}
+	fmt.Println("GO_READY=1")
+	// Flush stdout
+	os.Stdout.Sync()
+
+	// Wait for shutdown signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-sigCh:
+		fmt.Println("Shutting down go-libp2p node...")
+	case <-ctx.Done():
+	}
+}
+GOEOF
+
+RUN go mod tidy && go build -o /go-libp2p-node .
+
+# Runtime stage
+FROM alpine:3.19
+COPY --from=builder /go-libp2p-node /usr/local/bin/go-libp2p-node
+ENTRYPOINT ["/usr/local/bin/go-libp2p-node"]
