@@ -23,8 +23,9 @@
 /* ── Ping responder (inbound handler) ────────────────────────────────────── */
 
 /*
- * The responder receives 32 bytes and echoes them back.
- * After one exchange, close the stream.
+ * The responder echoes each 32-byte ping payload and keeps the stream open
+ * until the initiator closes it. go-libp2p reuses a single stream for
+ * multiple ping exchanges.
  */
 
 typedef struct {
@@ -32,18 +33,40 @@ typedef struct {
     uint8_t        payload[PING_PAYLOAD_LEN];
 } ping_responder_ctx_t;
 
+static void ping_responder_on_read(lp2p_stream_t *stream, lp2p_err_t err,
+                                   const lp2p_buf_t *buf, void *userdata);
+
+static void ping_responder_read_next(ping_responder_ctx_t *ctx) {
+    lp2p_err_t err = lp2p_stream_read(ctx->stream, PING_PAYLOAD_LEN,
+                                      ping_responder_on_read, ctx);
+    if (err != LP2P_OK) {
+        lp2p_stream_reset(ctx->stream);
+        free(ctx);
+    }
+}
+
 static void ping_responder_write_done(lp2p_stream_t *stream, lp2p_err_t err,
                                        void *userdata) {
     ping_responder_ctx_t *ctx = userdata;
-    (void)err;
-    /* Close write side after echo */
-    lp2p_stream_close(stream, NULL, NULL);
-    free(ctx);
+
+    if (err != LP2P_OK) {
+        lp2p_stream_reset(stream);
+        free(ctx);
+        return;
+    }
+
+    ping_responder_read_next(ctx);
 }
 
 static void ping_responder_on_read(lp2p_stream_t *stream, lp2p_err_t err,
                                     const lp2p_buf_t *buf, void *userdata) {
     ping_responder_ctx_t *ctx = userdata;
+
+    if (err == LP2P_ERR_EOF || err == LP2P_ERR_CONNECTION_CLOSED) {
+        lp2p_stream_close(stream, NULL, NULL);
+        free(ctx);
+        return;
+    }
 
     if (err != LP2P_OK || !buf || buf->len != PING_PAYLOAD_LEN) {
         lp2p_stream_reset(stream);
@@ -71,13 +94,7 @@ void lp2p_ping_handler(lp2p_stream_t *stream, void *userdata) {
     }
     ctx->stream = stream;
 
-    /* Read exactly 32 bytes */
-    lp2p_err_t err = lp2p_stream_read(stream, PING_PAYLOAD_LEN,
-                                        ping_responder_on_read, ctx);
-    if (err != LP2P_OK) {
-        lp2p_stream_reset(stream);
-        free(ctx);
-    }
+    ping_responder_read_next(ctx);
 }
 
 /* ── Ping initiator (outbound, called by host) ───────────────────────────── */

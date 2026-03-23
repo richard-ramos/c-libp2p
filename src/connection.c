@@ -36,7 +36,7 @@
 static void conn_start_security_negotiation(lp2p_conn_t *conn);
 static void conn_start_noise_handshake(lp2p_conn_t *conn);
 static void conn_start_mux_negotiation(lp2p_conn_t *conn);
-static void conn_become_ready(lp2p_conn_t *conn);
+static void conn_finish_ready(lp2p_conn_t *conn);
 static void conn_teardown(lp2p_conn_t *conn, lp2p_err_t reason);
 static void conn_defer(lp2p_conn_t *conn, conn_deferred_fn fn, void *arg);
 static void conn_async_cb(uv_async_t *handle);
@@ -1080,18 +1080,17 @@ static void conn_noise_on_read(lp2p_tcp_conn_t *tc, const uint8_t *data,
     conn_noise_drive(ctx);
 }
 
-/* ── Step 3: multistream-select /yamux/1.0.0 ──────────────────────────────── */
+/* ── Step 3: secure multistream-select /yamux/1.0.0 ──────────────────────── */
 
-static void conn_on_mux_negotiated(lp2p_err_t err, const char *protocol,
-                                    void *userdata) {
-    lp2p_conn_t *conn = (lp2p_conn_t *)userdata;
-    (void)protocol;
+typedef struct {
+    lp2p_conn_t      *conn;
+    ms_negotiation_t  neg;
+    lp2p_buffer_t     plain_buf;
+} conn_secure_ms_ctx_t;
 
-    if (err != LP2P_OK) {
-        conn_teardown(conn, LP2P_ERR_NEGOTIATION_FAILED);
-        return;
-    }
-
+static void conn_create_mux_session(lp2p_conn_t *conn,
+                                    const uint8_t *initial_plain,
+                                    size_t initial_plain_len) {
     /* Create yamux session */
     bool is_initiator = !conn->is_inbound;
 
@@ -1115,39 +1114,360 @@ static void conn_on_mux_negotiated(lp2p_err_t err, const char *protocol,
     conn->mux->vtable = yamux_get_vtable();
     conn->mux->impl = ys;
 
-    /* Now install the TCP read callback for the data path */
-    lp2p_tcp_conn_start_read(conn->tcp, conn_on_tcp_read, conn);
+    /* Enter READY before feeding any buffered mux bytes so inbound streams
+     * negotiated in the same Noise payload are accepted instead of reset. */
+    conn->state = CONN_STATE_READY;
 
-    /* Connection is ready */
-    conn_become_ready(conn);
+    if (initial_plain_len > 0) {
+        lp2p_err_t mux_err = conn->mux->vtable->on_data(
+            conn->mux->impl, initial_plain, initial_plain_len);
+        if (mux_err != LP2P_OK) {
+            conn_teardown(conn, LP2P_ERR_MUX);
+            return;
+        }
+    }
+
+    /* Install the TCP read callback for encrypted transport frames. Any bytes
+     * still buffered in the TCP transport are newer than initial_plain. */
+    lp2p_err_t err = lp2p_tcp_conn_start_read(conn->tcp, conn_on_tcp_read, conn);
+    if (err != LP2P_OK) {
+        conn_teardown(conn, err);
+        return;
+    }
+
+    if (conn->state != CONN_STATE_READY || conn->closing) {
+        return;
+    }
+
+    conn_finish_ready(conn);
+}
+
+static void conn_secure_ms_free(conn_secure_ms_ctx_t *ctx) {
+    if (!ctx) return;
+    lp2p_buffer_free(&ctx->plain_buf);
+    free(ctx);
+}
+
+static void conn_secure_ms_fail(conn_secure_ms_ctx_t *ctx, lp2p_err_t err) {
+    lp2p_conn_t *conn = ctx->conn;
+    conn_secure_ms_free(ctx);
+    conn_teardown(conn, err);
+}
+
+static void conn_secure_ms_done(conn_secure_ms_ctx_t *ctx) {
+    lp2p_conn_t *conn = ctx->conn;
+    uint8_t *initial_plain = ctx->plain_buf.data;
+    size_t initial_plain_len = ctx->plain_buf.len;
+
+    /* conn_create_mux_session only consumes the buffer during this call. */
+    conn_create_mux_session(conn, initial_plain, initial_plain_len);
+    conn_secure_ms_free(ctx);
+}
+
+static lp2p_err_t conn_secure_ms_send_frame(conn_secure_ms_ctx_t *ctx,
+                                            const char *msg);
+static void conn_secure_ms_drive(conn_secure_ms_ctx_t *ctx);
+
+static lp2p_err_t conn_ensure_decrypt_capacity(lp2p_conn_t *conn, size_t frame_len) {
+    if (frame_len <= conn->decrypt_buf_cap) {
+        return LP2P_OK;
+    }
+
+    size_t new_cap = frame_len + 1024;
+    uint8_t *new_buf = realloc(conn->decrypt_buf, new_cap);
+    if (!new_buf) {
+        return LP2P_ERR_NOMEM;
+    }
+
+    conn->decrypt_buf = new_buf;
+    conn->decrypt_buf_cap = new_cap;
+    return LP2P_OK;
+}
+
+static void conn_secure_ms_process_plain(conn_secure_ms_ctx_t *ctx) {
+    while (true) {
+        ms_state_t state = ctx->neg.state;
+        if (state != MS_STATE_RECV_HEADER &&
+            state != MS_STATE_RECV_PROPOSAL &&
+            state != MS_STATE_RECV_ACCEPT) {
+            return;
+        }
+
+        const uint8_t *msg = NULL;
+        size_t msg_len = 0;
+        int consumed = ms_frame_decode(ctx->plain_buf.data, ctx->plain_buf.len,
+                                       &msg, &msg_len);
+        if (consumed < 0) {
+            conn_secure_ms_fail(ctx, LP2P_ERR_PROTOCOL);
+            return;
+        }
+        if (consumed == 0) {
+            return;
+        }
+
+        uint8_t msg_copy[MULTISTREAM_MAX_MSG_LEN];
+        memcpy(msg_copy, msg, msg_len);
+
+        size_t remaining = ctx->plain_buf.len - (size_t)consumed;
+        if (remaining > 0) {
+            memmove(ctx->plain_buf.data,
+                    ctx->plain_buf.data + (size_t)consumed,
+                    remaining);
+        }
+        ctx->plain_buf.len = remaining;
+
+        switch (state) {
+        case MS_STATE_RECV_HEADER:
+            if (msg_len != strlen(MULTISTREAM_PROTOCOL_ID) ||
+                memcmp(msg_copy, MULTISTREAM_PROTOCOL_ID, msg_len) != 0) {
+                conn_secure_ms_fail(ctx, LP2P_ERR_NEGOTIATION_FAILED);
+                return;
+            }
+
+            ctx->neg.state = ctx->neg.is_initiator
+                ? MS_STATE_SEND_PROPOSAL
+                : MS_STATE_RECV_PROPOSAL;
+            conn_secure_ms_drive(ctx);
+            return;
+
+        case MS_STATE_RECV_PROPOSAL: {
+            char proto[sizeof(ctx->neg.negotiated_proto)];
+            size_t copy_len = msg_len < sizeof(proto) - 1
+                ? msg_len
+                : sizeof(proto) - 1;
+            memcpy(proto, msg_copy, copy_len);
+            proto[copy_len] = '\0';
+
+            bool found = false;
+            for (size_t i = 0; i < ctx->neg.supported_protos_count; i++) {
+                if (strcmp(proto, ctx->neg.supported_protos[i]) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) {
+                memcpy(ctx->neg.negotiated_proto, proto, copy_len + 1);
+                ctx->neg.state = MS_STATE_SEND_ACCEPT;
+            } else {
+                ctx->neg.state = MS_STATE_RECV_PROPOSAL;
+                lp2p_err_t err = conn_secure_ms_send_frame(ctx, MULTISTREAM_NA);
+                if (err != LP2P_OK) {
+                    conn_secure_ms_fail(ctx, err);
+                }
+                return;
+            }
+
+            conn_secure_ms_drive(ctx);
+            return;
+        }
+
+        case MS_STATE_RECV_ACCEPT: {
+            size_t proto_len = strlen(ctx->neg.proposed_proto);
+
+            if (msg_len == strlen(MULTISTREAM_NA) &&
+                memcmp(msg_copy, MULTISTREAM_NA, msg_len) == 0) {
+                conn_secure_ms_fail(ctx, LP2P_ERR_PROTOCOL_NOT_SUPPORTED);
+                return;
+            }
+
+            if (msg_len != proto_len ||
+                memcmp(msg_copy, ctx->neg.proposed_proto, proto_len) != 0) {
+                conn_secure_ms_fail(ctx, LP2P_ERR_NEGOTIATION_FAILED);
+                return;
+            }
+
+            memcpy(ctx->neg.negotiated_proto, ctx->neg.proposed_proto,
+                   proto_len + 1);
+            ctx->neg.state = MS_STATE_DONE;
+            conn_secure_ms_drive(ctx);
+            return;
+        }
+
+        default:
+            conn_secure_ms_fail(ctx, LP2P_ERR_INTERNAL);
+            return;
+        }
+    }
+}
+
+static void conn_secure_ms_on_read(lp2p_tcp_conn_t *tc, const uint8_t *data,
+                                   size_t len, lp2p_err_t err, void *userdata) {
+    conn_secure_ms_ctx_t *ctx = (conn_secure_ms_ctx_t *)userdata;
+    lp2p_conn_t *conn = ctx->conn;
+    (void)data;
+    (void)len;
+
+    if (err != LP2P_OK) {
+        conn_secure_ms_fail(ctx, err);
+        return;
+    }
+
+    while (tc->read_buf_len >= NOISE_FRAME_HDR_LEN) {
+        uint16_t frame_len = ((uint16_t)tc->read_buf[0] << 8) |
+                              (uint16_t)tc->read_buf[1];
+        size_t total_frame = NOISE_FRAME_HDR_LEN + frame_len;
+
+        if (tc->read_buf_len < total_frame) {
+            break;
+        }
+
+        err = conn_ensure_decrypt_capacity(conn, frame_len);
+        if (err != LP2P_OK) {
+            conn_secure_ms_fail(ctx, err);
+            return;
+        }
+
+        size_t plain_len = 0;
+        err = conn->security->vtable->decrypt(
+            conn->security->impl,
+            tc->read_buf, total_frame,
+            conn->decrypt_buf, &plain_len);
+        if (err != LP2P_OK) {
+            conn_secure_ms_fail(ctx, LP2P_ERR_CRYPTO);
+            return;
+        }
+
+        lp2p_tcp_conn_consume(tc, total_frame);
+
+        if (plain_len > 0 &&
+            !lp2p_buffer_append(&ctx->plain_buf, conn->decrypt_buf, plain_len)) {
+            conn_secure_ms_fail(ctx, LP2P_ERR_NOMEM);
+            return;
+        }
+
+        conn_secure_ms_process_plain(ctx);
+        if (!conn->security || conn->state == CONN_STATE_CLOSING ||
+            conn->state == CONN_STATE_CLOSED || conn->mux) {
+            return;
+        }
+    }
+}
+
+static void conn_secure_ms_on_write_done(lp2p_tcp_conn_t *tc, lp2p_err_t err,
+                                         void *userdata) {
+    conn_secure_ms_ctx_t *ctx = (conn_secure_ms_ctx_t *)userdata;
+    (void)tc;
+
+    if (err != LP2P_OK) {
+        conn_secure_ms_fail(ctx, err);
+        return;
+    }
+
+    conn_secure_ms_drive(ctx);
+}
+
+static lp2p_err_t conn_secure_ms_send_frame(conn_secure_ms_ctx_t *ctx,
+                                            const char *msg) {
+    uint8_t plain_frame[MULTISTREAM_MAX_MSG_LEN + 16];
+    size_t plain_len = ms_frame_encode(msg, plain_frame, sizeof(plain_frame));
+    if (plain_len == 0) {
+        return LP2P_ERR_PROTOCOL;
+    }
+
+    size_t enc_cap = plain_len + NOISE_FRAME_HDR_LEN + NOISE_AEAD_TAG_LEN + 16;
+    uint8_t *enc_frame = malloc(enc_cap);
+    if (!enc_frame) {
+        return LP2P_ERR_NOMEM;
+    }
+
+    size_t enc_len = 0;
+    lp2p_err_t err = ctx->conn->security->vtable->encrypt(
+        ctx->conn->security->impl, plain_frame, plain_len, enc_frame, &enc_len);
+    if (err != LP2P_OK) {
+        free(enc_frame);
+        return err;
+    }
+
+    err = lp2p_tcp_conn_write(ctx->conn->tcp, enc_frame, enc_len,
+                              conn_secure_ms_on_write_done, ctx);
+    free(enc_frame);
+    return err;
+}
+
+static void conn_secure_ms_drive(conn_secure_ms_ctx_t *ctx) {
+    switch (ctx->neg.state) {
+    case MS_STATE_SEND_HEADER:
+        ctx->neg.state = MS_STATE_RECV_HEADER;
+        {
+            lp2p_err_t err = conn_secure_ms_send_frame(ctx, MULTISTREAM_PROTOCOL_ID);
+            if (err != LP2P_OK) {
+                conn_secure_ms_fail(ctx, err);
+            }
+        }
+        return;
+
+    case MS_STATE_RECV_HEADER:
+    case MS_STATE_RECV_PROPOSAL:
+    case MS_STATE_RECV_ACCEPT:
+        if (ctx->plain_buf.len > 0) {
+            conn_secure_ms_process_plain(ctx);
+            return;
+        }
+        if (lp2p_tcp_conn_start_read(ctx->conn->tcp, conn_secure_ms_on_read, ctx) != LP2P_OK) {
+            conn_secure_ms_fail(ctx, LP2P_ERR_NEGOTIATION_FAILED);
+        }
+        return;
+
+    case MS_STATE_SEND_PROPOSAL:
+        ctx->neg.state = MS_STATE_RECV_ACCEPT;
+        {
+            lp2p_err_t err = conn_secure_ms_send_frame(ctx, ctx->neg.proposed_proto);
+            if (err != LP2P_OK) {
+                conn_secure_ms_fail(ctx, err);
+            }
+        }
+        return;
+
+    case MS_STATE_SEND_ACCEPT:
+        ctx->neg.state = MS_STATE_DONE;
+        {
+            lp2p_err_t err = conn_secure_ms_send_frame(ctx, ctx->neg.negotiated_proto);
+            if (err != LP2P_OK) {
+                conn_secure_ms_fail(ctx, err);
+            }
+        }
+        return;
+
+    case MS_STATE_DONE:
+        conn_secure_ms_done(ctx);
+        return;
+
+    case MS_STATE_FAILED:
+        conn_secure_ms_fail(ctx, LP2P_ERR_NEGOTIATION_FAILED);
+        return;
+    }
 }
 
 static void conn_start_mux_negotiation(lp2p_conn_t *conn) {
     conn->state = CONN_STATE_MUX_NEGOTIATING;
 
+    conn_secure_ms_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        conn_teardown(conn, LP2P_ERR_NOMEM);
+        return;
+    }
+
+    ctx->conn = conn;
+    ctx->neg.state = MS_STATE_SEND_HEADER;
+    ctx->neg.is_initiator = !conn->is_inbound;
+    lp2p_buffer_init(&ctx->plain_buf);
+
     if (!conn->is_inbound) {
-        lp2p_err_t err = ms_negotiate_initiator(
-            conn->tcp, YAMUX_PROTO_ID,
-            conn_on_mux_negotiated, conn);
-        if (err != LP2P_OK) {
-            conn_teardown(conn, LP2P_ERR_NEGOTIATION_FAILED);
-        }
+        strncpy(ctx->neg.proposed_proto, YAMUX_PROTO_ID,
+                sizeof(ctx->neg.proposed_proto) - 1);
     } else {
         static const char *mux_protos[] = { YAMUX_PROTO_ID };
-        lp2p_err_t err = ms_negotiate_responder(
-            conn->tcp, mux_protos, 1,
-            conn_on_mux_negotiated, conn);
-        if (err != LP2P_OK) {
-            conn_teardown(conn, LP2P_ERR_NEGOTIATION_FAILED);
-        }
+        ctx->neg.supported_protos = mux_protos;
+        ctx->neg.supported_protos_count = 1;
     }
+
+    conn_secure_ms_drive(ctx);
 }
 
 /* ── Become ready ─────────────────────────────────────────────────────────── */
 
-static void conn_become_ready(lp2p_conn_t *conn) {
-    conn->state = CONN_STATE_READY;
-
+static void conn_finish_ready(lp2p_conn_t *conn) {
     /* Process any pending open-stream requests */
     while (!lp2p_list_empty(&conn->pending_streams)) {
         lp2p_list_node_t *n = lp2p_list_pop_front(&conn->pending_streams);
