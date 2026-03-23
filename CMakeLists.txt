@@ -145,7 +145,7 @@ endif()
 
 # ── Examples ──────────────────────────────────────────────────────────────────
 if(LP2P_BUILD_EXAMPLES)
-    foreach(example echo_server chat ping_peer)
+    foreach(example echo_server echo_client chat ping_peer)
         add_executable(example_${example} examples/${example}.c)
         target_link_libraries(example_${example} PRIVATE lp2p)
     endforeach()
