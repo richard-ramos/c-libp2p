@@ -1,0 +1,32 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        cmake \
+        libprotobuf-c-dev \
+        libsodium-dev \
+        libssl-dev \
+        libuv1-dev \
+        pkg-config \
+        protobuf-c-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+
+COPY CMakeLists.txt ./
+COPY cmake/ cmake/
+COPY examples/ examples/
+COPY include/ include/
+COPY proto/ proto/
+COPY src/ src/
+
+RUN cmake -B build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DLP2P_BUILD_TESTS=OFF \
+        -DLP2P_ENABLE_QUIC=OFF \
+    && cmake --build build --parallel "$(nproc)" --target example_ping_peer \
+    && install -m 0755 build/example_ping_peer /usr/local/bin/ping_peer

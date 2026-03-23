@@ -86,7 +86,7 @@ cd ..
 ```
 
 The static libraries are at `build/libssl.a` and `build/libcrypto.a` directly
-under the build directory — not in any subdirectory.
+under the build directory.
 
 #### Step 3 — Build ngtcp2 v1.9.1
 

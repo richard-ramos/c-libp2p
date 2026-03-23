@@ -52,8 +52,10 @@ fi
 
 echo "Go node ready: $GO_MULTIADDR"
 
-# Build the multiaddr using the docker hostname
-GO_TARGET="/ip4/go-node/tcp/4001/p2p/${GO_PEER_ID}"
+# Build the multiaddr using the Docker service hostname.
+# The C dialer supports dns4/dns6 multiaddrs, and `go-node` is resolved
+# inside the Compose network rather than being a literal IPv4 address.
+GO_TARGET="/dns4/go-node/tcp/4001/p2p/${GO_PEER_ID}"
 echo "Target for c-node: $GO_TARGET"
 
 # ── Test 1: Ping (TCP + Ed25519) ─────────────────────────────────────────────
