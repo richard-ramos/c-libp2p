@@ -13,6 +13,7 @@
 #include <sodium.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <openssl/x509.h>
 #include <stdlib.h>
 #include <string.h>
 

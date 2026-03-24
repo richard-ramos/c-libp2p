@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: c-libp2p
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          path: c-libp2p
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            libprotobuf-c-dev \
+            libsodium-dev \
+            libssl-dev \
+            libuv1-dev \
+            pkg-config \
+            protobuf-c-compiler
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLP2P_BUILD_EXAMPLES=OFF \
+            -DLP2P_BUILD_TESTS=ON \
+            -DLP2P_ENABLE_QUIC=OFF
+
+      - name: Build
+        run: cmake --build build --parallel "$(nproc)"
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure

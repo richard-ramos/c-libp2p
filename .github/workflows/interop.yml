@@ -1,0 +1,72 @@
+name: Interop
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  c-go-interop:
+    name: C <-> Go Interop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          path: c-libp2p
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: c-libp2p/interop/go-libp2p/go.mod
+
+      - name: Install QUIC build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            git \
+            libnghttp3-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Build BoringSSL
+        working-directory: ${{ github.workspace }}
+        run: |
+          git clone https://boringssl.googlesource.com/boringssl
+          git -C boringssl checkout 7d88bb1bf3372bda1134ad8bf624b25b88e0db86
+          cmake -S boringssl -B boringssl/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DBUILD_SHARED_LIBS=OFF
+          cmake --build boringssl/build --parallel "$(nproc)"
+
+      - name: Build ngtcp2
+        working-directory: ${{ github.workspace }}
+        run: |
+          git clone --recurse-submodules --depth 1 --branch v1.9.1 \
+            https://github.com/ngtcp2/ngtcp2.git
+          cmake -S ngtcp2 -B ngtcp2/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_BORINGSSL=ON \
+            -DENABLE_OPENSSL=OFF \
+            -DBORINGSSL_INCLUDE_DIR="${GITHUB_WORKSPACE}/boringssl/include" \
+            -DBORINGSSL_LIBRARIES="${GITHUB_WORKSPACE}/boringssl/build/libssl.a;${GITHUB_WORKSPACE}/boringssl/build/libcrypto.a" \
+            -DENABLE_STATIC_LIB=ON \
+            -DENABLE_SHARED_LIB=OFF
+          cmake --build ngtcp2/build --parallel "$(nproc)"
+
+      - name: Run Docker-based interop checks
+        working-directory: c-libp2p
+        run: bash interop/test_interop.sh
