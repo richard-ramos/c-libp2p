@@ -11,7 +11,8 @@ typedef struct lp2p_transport lp2p_transport_t;
 
 typedef struct {
     lp2p_err_t (*listen)(void *transport, const lp2p_multiaddr_t *addr,
-                          void (*on_conn)(void *transport, lp2p_conn_t *conn),
+                          void (*on_conn)(void *transport, lp2p_conn_t *conn,
+                                          void *userdata),
                           void *userdata);
     lp2p_err_t (*dial)(void *transport, const lp2p_multiaddr_t *addr,
                         void (*on_conn)(lp2p_conn_t *conn, lp2p_err_t err, void *userdata),

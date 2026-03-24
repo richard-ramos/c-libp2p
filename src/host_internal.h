@@ -14,6 +14,9 @@
 #include "dialer.h"
 #include "listener.h"
 #include "transport/transport.h"
+#ifdef LP2P_HAVE_QUIC
+#include "transport/quic/quic_transport.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +56,10 @@ struct lp2p_host {
     lp2p_protocol_router_t   *router;
     lp2p_dialer_t            *dialer;
     lp2p_transport_t         *transport;
+#ifdef LP2P_HAVE_QUIC
+    lp2p_dialer_t            *quic_dialer;
+    lp2p_transport_t         *quic_transport;
+#endif
 
     /* Listeners */
     lp2p_listener_t          *listeners[LP2P_MAX_LISTENERS];

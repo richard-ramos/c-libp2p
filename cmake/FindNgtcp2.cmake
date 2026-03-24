@@ -16,21 +16,28 @@ find_path(NGTCP2_BUILD_INCLUDE_DIR NAMES ngtcp2/version.h
 find_path(NGTCP2_CRYPTO_INCLUDE_DIR NAMES ngtcp2/ngtcp2_crypto.h
     HINTS
         "${NGTCP2_ROOT}/crypto/includes"
+        "${NGTCP2_ROOT}/build/crypto/includes"
         /workspace/group/ngtcp2/crypto/includes
 )
 
 find_library(NGTCP2_LIBRARY NAMES ngtcp2 libngtcp2.a
     HINTS
         "${NGTCP2_ROOT}/lib"
+        "${NGTCP2_ROOT}/build/lib"
         /workspace/group/ngtcp2/build/lib
 )
 find_library(NGTCP2_CRYPTO_LIBRARY NAMES ngtcp2_crypto_boringssl ngtcp2_crypto_openssl
     HINTS
         "${NGTCP2_ROOT}/crypto/boringssl"
+        "${NGTCP2_ROOT}/build/crypto/boringssl"
         /workspace/group/ngtcp2/build/crypto/boringssl
 )
 include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(Ngtcp2 DEFAULT_MSG NGTCP2_LIBRARY NGTCP2_INCLUDE_DIR)
+find_package_handle_standard_args(Ngtcp2 DEFAULT_MSG
+    NGTCP2_LIBRARY
+    NGTCP2_CRYPTO_LIBRARY
+    NGTCP2_INCLUDE_DIR
+)
 set(NGTCP2_LIBRARIES    ${NGTCP2_LIBRARY} ${NGTCP2_CRYPTO_LIBRARY})
 set(NGTCP2_INCLUDE_DIRS ${NGTCP2_INCLUDE_DIR})
 if(NGTCP2_BUILD_INCLUDE_DIR)

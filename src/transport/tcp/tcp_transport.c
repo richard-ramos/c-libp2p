@@ -8,7 +8,8 @@
 
 /* ── Forward declarations ─────────────────────────────────────────────────── */
 static lp2p_err_t tcp_listen(void *transport, const lp2p_multiaddr_t *addr,
-                              void (*on_conn)(void *transport, lp2p_conn_t *conn),
+                              void (*on_conn)(void *transport, lp2p_conn_t *conn,
+                                              void *userdata),
                               void *userdata);
 static lp2p_err_t tcp_dial(void *transport, const lp2p_multiaddr_t *addr,
                              void (*on_conn)(lp2p_conn_t *conn, lp2p_err_t err, void *userdata),
@@ -279,12 +280,13 @@ static void on_new_connection(uv_stream_t *server, int status)
        (owned by coordinator) will wrap this properly. We cast through void*
        to signal that this is a raw TCP conn that needs upgrading. */
     if (impl->on_conn) {
-        impl->on_conn(impl, (lp2p_conn_t *)tc);
+        impl->on_conn(impl, (lp2p_conn_t *)tc, impl->on_conn_ud);
     }
 }
 
 static lp2p_err_t tcp_listen(void *transport, const lp2p_multiaddr_t *addr,
-                              void (*on_conn)(void *transport, lp2p_conn_t *conn),
+                              void (*on_conn)(void *transport, lp2p_conn_t *conn,
+                                              void *userdata),
                               void *userdata)
 {
     lp2p_tcp_transport_t *impl = (lp2p_tcp_transport_t *)transport;

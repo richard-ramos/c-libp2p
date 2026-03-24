@@ -15,6 +15,9 @@
 #include "mux/yamux/yamux_internal.h"
 #include "stream_internal.h"
 #include "crypto/keypair_internal.h"
+#ifdef LP2P_HAVE_QUIC
+#include "transport/quic/quic_transport.h"
+#endif
 
 #include "libp2p/crypto.h"
 #include "libp2p/multiaddr.h"
@@ -145,6 +148,7 @@ lp2p_conn_t *lp2p_conn_new(uv_loop_t *loop, bool is_inbound, void *host_ptr) {
     if (!conn) return NULL;
 
     conn->state = CONN_STATE_TRANSPORT_CONNECTING;
+    conn->backend = LP2P_CONN_BACKEND_TCP_YAMUX;
     conn->is_inbound = is_inbound;
     conn->loop = loop;
     conn->host = host_ptr;
@@ -197,6 +201,12 @@ void lp2p_conn_free(lp2p_conn_t *conn) {
     if (conn->destroy_started) return;
 
     conn->destroy_started = true;
+
+#ifdef LP2P_HAVE_QUIC
+    if (conn->backend == LP2P_CONN_BACKEND_QUIC && conn->backend_impl) {
+        lp2p_quic_conn_cleanup(conn);
+    }
+#endif
 
     /* Free security session */
     if (conn->security) {
@@ -274,6 +284,11 @@ void lp2p_conn_attach_tcp(lp2p_conn_t *conn, lp2p_tcp_conn_t *tc) {
 void lp2p_conn_set_protocol_router(lp2p_conn_t *conn, lp2p_protocol_router_t *router) {
     if (!conn) return;
     conn->router = router;
+#ifdef LP2P_HAVE_QUIC
+    if (conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        lp2p_quic_conn_notify_pending_streams(conn);
+    }
+#endif
 }
 
 /* ── TCP read callback (raw bytes from the wire) ──────────────────────────── */
@@ -437,6 +452,7 @@ static lp2p_err_t conn_open_stream_negotiated(lp2p_conn_t *conn,
                                               const char *protocol_id,
                                               lp2p_open_stream_cb cb,
                                               void *userdata);
+static lp2p_err_t conn_open_raw_stream(lp2p_conn_t *conn, lp2p_stream_t **out);
 
 static bool conn_ms_parse_payload(const lp2p_buf_t *buf, char *out, size_t out_cap) {
     if (!buf || !buf->data || buf->len == 0 || buf->len >= out_cap) return false;
@@ -713,10 +729,10 @@ static lp2p_err_t conn_open_stream_negotiated(lp2p_conn_t *conn,
                                               const char *protocol_id,
                                               lp2p_open_stream_cb cb,
                                               void *userdata) {
-    if (!conn || !protocol_id || !conn->mux) return LP2P_ERR_INVALID_ARG;
+    if (!conn || !protocol_id) return LP2P_ERR_INVALID_ARG;
 
     lp2p_stream_t *stream = NULL;
-    lp2p_err_t err = conn->mux->vtable->open_stream(conn->mux->impl, &stream);
+    lp2p_err_t err = conn_open_raw_stream(conn, &stream);
     if (err != LP2P_OK) return err;
     if (!stream) return LP2P_ERR_INTERNAL;
 
@@ -750,18 +766,29 @@ static lp2p_err_t conn_open_stream_negotiated(lp2p_conn_t *conn,
     return LP2P_OK;
 }
 
-/* ── Inbound stream callback from mux ─────────────────────────────────────── */
+static lp2p_err_t conn_open_raw_stream(lp2p_conn_t *conn, lp2p_stream_t **out) {
+    if (!conn || !out) return LP2P_ERR_INVALID_ARG;
 
-static void conn_on_mux_inbound_stream(yamux_session_t *session,
-                                        lp2p_stream_t *stream, void *userdata) {
-    lp2p_conn_t *conn = (lp2p_conn_t *)userdata;
-    (void)session;
+    switch (conn->backend) {
+    case LP2P_CONN_BACKEND_TCP_YAMUX:
+        if (!conn->mux) return LP2P_ERR_INVALID_ARG;
+        return conn->mux->vtable->open_stream(conn->mux->impl, out);
+#ifdef LP2P_HAVE_QUIC
+    case LP2P_CONN_BACKEND_QUIC:
+        return lp2p_quic_conn_open_stream_raw(conn, out);
+#endif
+    default:
+        return LP2P_ERR_INTERNAL;
+    }
+}
+
+/* ── Inbound stream callback from the underlying stream transport ─────────── */
+
+void lp2p_conn_handle_inbound_stream(lp2p_conn_t *conn, lp2p_stream_t *stream) {
+    if (!conn || !stream) return;
 
     if (conn->goaway_received || conn->state != CONN_STATE_READY) {
-        /* Not accepting new streams */
-        if (conn->mux) {
-            conn->mux->vtable->reset_stream(conn->mux->impl, stream);
-        }
+        lp2p_stream_reset(stream);
         return;
     }
 
@@ -769,17 +796,13 @@ static void conn_on_mux_inbound_stream(yamux_session_t *session,
     stream->conn = conn;
 
     if (!conn->router) {
-        if (conn->mux) {
-            conn->mux->vtable->reset_stream(conn->mux->impl, stream);
-        }
+        lp2p_stream_reset(stream);
         return;
     }
 
     conn_inbound_stream_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx) {
-        if (conn->mux) {
-            conn->mux->vtable->reset_stream(conn->mux->impl, stream);
-        }
+        lp2p_stream_reset(stream);
         return;
     }
 
@@ -791,6 +814,12 @@ static void conn_on_mux_inbound_stream(yamux_session_t *session,
     if (err != LP2P_OK) {
         conn_inbound_stream_fail(ctx);
     }
+}
+
+static void conn_on_mux_inbound_stream(yamux_session_t *session,
+                                        lp2p_stream_t *stream, void *userdata) {
+    (void)session;
+    lp2p_conn_handle_inbound_stream((lp2p_conn_t *)userdata, stream);
 }
 
 /* ── Upgrade pipeline ─────────────────────────────────────────────────────── */
@@ -932,8 +961,9 @@ static void conn_noise_drive(conn_noise_ctx_t *ctx) {
             return;
         }
 
-        /* Set the remote peer ID */
-        conn->remote_peer = ctx->hs.remote_peer_id;
+        /* noise_handshake_split zeroizes the handshake state after copying the
+         * verified remote peer ID into the transport session. */
+        conn->remote_peer = ctx->session.remote_peer_id;
 
         /* Create the security session */
         conn->security = calloc(1, sizeof(lp2p_security_session_t));
@@ -1617,6 +1647,12 @@ lp2p_err_t lp2p_conn_close(lp2p_conn_t *conn,
 
     conn->close_cb.cb = cb;
     conn->close_cb.userdata = userdata;
+
+#ifdef LP2P_HAVE_QUIC
+    if (conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        return lp2p_quic_conn_close(conn);
+    }
+#endif
 
     if (conn->state == CONN_STATE_READY && conn->mux && !conn->goaway_sent) {
         /* Send GoAway(normal) and drain */

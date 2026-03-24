@@ -99,6 +99,7 @@ cd ngtcp2
 
 cmake -B build \
   -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
   -DENABLE_BORINGSSL=ON \
   -DENABLE_OPENSSL=OFF \
   -DBORINGSSL_INCLUDE_DIR=$WORKDIR/boringssl/include \
@@ -115,7 +116,7 @@ cd ..
 ```bash
 cd /path/to/c-libp2p
 
-cmake -B build \
+cmake -B build-quic \
   -DCMAKE_BUILD_TYPE=Release \
   -DLP2P_ENABLE_QUIC=ON \
   -DNGTCP2_ROOT=$WORKDIR/ngtcp2 \
@@ -123,14 +124,14 @@ cmake -B build \
   -DOPENSSL_SSL_LIBRARY=$WORKDIR/boringssl/build/libssl.a \
   -DOPENSSL_CRYPTO_LIBRARY=$WORKDIR/boringssl/build/libcrypto.a \
   -DOPENSSL_VERSION=1.1.1
-cmake --build build --parallel $(nproc)
+cmake --build build-quic --parallel $(nproc)
 ```
 
 ## CMake Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `LP2P_ENABLE_QUIC` | `OFF` | Enable QUIC transport (requires BoringSSL + ngtcp2) |
+| `LP2P_ENABLE_QUIC` | `ON` | Enable QUIC transport (requires BoringSSL + ngtcp2) |
 | `LP2P_BUILD_TESTS` | `ON` | Build the test suite |
 | `LP2P_BUILD_EXAMPLES` | `ON` | Build example programs |
 | `NGTCP2_ROOT` | — | Path to the ngtcp2 source root (QUIC builds) |
@@ -185,7 +186,7 @@ Press Ctrl-C to exit.
 The repository includes a small `go-libp2p` helper under `interop/go-libp2p/`
 that can run as a server or as ping/echo clients against the C examples.
 
-### Docker smoke test
+### Docker smoke tests
 
 If you want a containerized smoke test, use the existing interop harness:
 
@@ -195,8 +196,25 @@ cd interop
 ```
 
 This script builds the Docker images, starts the Go node from
-`interop/Dockerfile.go-libp2p`, and runs the C `ping_peer` example against it.
-It currently verifies ping interoperability in the `c -> go` direction.
+`interop/Dockerfile.go-libp2p`, and runs the C examples against it in the
+`c -> go` direction. It now covers four smoke cases:
+
+- `ping_peer` over TCP
+- `echo_client` over TCP
+- `ping_peer` over QUIC (`/udp/.../quic-v1`)
+- `echo_client` over QUIC (`/udp/.../quic-v1`)
+
+The QUIC-enabled C image reuses the local dependency layout described in the
+QUIC build instructions above, so the following sibling directories must exist:
+
+```text
+<workspace>/
+├── boringssl/
+├── ngtcp2/
+└── c-libp2p/
+```
+
+When the smoke test passes, it finishes with `RESULT: PASS`.
 
 ### Local C <-> Go interop
 
@@ -212,12 +230,52 @@ go build -o /tmp/go-libp2p-interop .
 cd ../..
 ```
 
-#### Go clients -> C server
+#### Local QUIC build and tests
 
-Start the C echo server:
+To run the examples and the C test suite with QUIC enabled, configure a
+separate build tree that points at your local BoringSSL and ngtcp2 artifacts:
 
 ```bash
-./build/example_echo_server
+export WORKDIR=~/c-libp2p-deps
+
+cmake -B build-quic \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DLP2P_ENABLE_QUIC=ON \
+    -DLP2P_BUILD_TESTS=ON \
+    -DNGTCP2_ROOT=$WORKDIR/ngtcp2 \
+    -DOPENSSL_INCLUDE_DIR=$WORKDIR/boringssl/include \
+    -DOPENSSL_SSL_LIBRARY=$WORKDIR/boringssl/build/libssl.a \
+    -DOPENSSL_CRYPTO_LIBRARY=$WORKDIR/boringssl/build/libcrypto.a \
+    -DOPENSSL_VERSION=1.1.1
+cmake --build build-quic --parallel $(nproc)
+ctest --test-dir build-quic --output-on-failure
+```
+
+The `build-quic` test suite includes the normal unit/integration coverage plus
+the dedicated `test_quic_transport` target.
+
+You can then run the QUIC examples directly:
+
+```bash
+./build-quic/example_echo_server /ip4/127.0.0.1/udp/9000/quic-v1
+
+./build-quic/example_echo_client \
+    /ip4/127.0.0.1/udp/9000/quic-v1/p2p/<peer-id> \
+    "hello over quic"
+
+./build-quic/example_ping_peer \
+    /ip4/127.0.0.1/udp/9000/quic-v1/p2p/<peer-id>
+```
+
+The same `build-quic` binaries can still dial plain TCP multiaddrs, so one QUIC
+build is enough to smoke both transports locally.
+
+#### Go clients -> C server
+
+TCP:
+
+```bash
+./build/example_echo_server /ip4/127.0.0.1/tcp/9000
 ```
 
 It prints:
@@ -248,12 +306,26 @@ Expected results:
 `example_echo_server` also serves `/ipfs/ping/1.0.0`, so it is enough for both
 ping and echo checks.
 
-#### C clients -> Go server
-
-Start the Go helper in server mode:
+QUIC:
 
 ```bash
-/tmp/go-libp2p-interop server
+./build-quic/example_echo_server /ip4/127.0.0.1/udp/9000/quic-v1
+
+/tmp/go-libp2p-interop ping-client \
+    --target /ip4/127.0.0.1/udp/9000/quic-v1/p2p/<c-peer-id> \
+    --count 5
+
+/tmp/go-libp2p-interop echo-client \
+    --target /ip4/127.0.0.1/udp/9000/quic-v1/p2p/<c-peer-id> \
+    --message "hello from go to c over quic"
+```
+
+#### C clients -> Go server
+
+TCP:
+
+```bash
+/tmp/go-libp2p-interop server --listen /ip4/127.0.0.1/tcp/4001
 ```
 
 It prints output like:
@@ -276,6 +348,23 @@ Expected results:
 
 - `example_ping_peer` prints 5 RTT lines and ends with `Done.`
 - `example_echo_client` prints `Echoed: hello from c to go`
+
+QUIC:
+
+```bash
+/tmp/go-libp2p-interop server --listen /ip4/127.0.0.1/udp/4001/quic-v1
+
+./build-quic/example_ping_peer \
+    /ip4/127.0.0.1/udp/4001/quic-v1/p2p/<go-peer-id>
+
+./build-quic/example_echo_client \
+    /ip4/127.0.0.1/udp/4001/quic-v1/p2p/<go-peer-id> \
+    "hello from c to go over quic"
+```
+
+If you already have a `build-quic` tree, those binaries can also dial the TCP
+multiaddrs shown above, so one QUIC-enabled build is enough to smoke both
+transport modes locally.
 
 ## Architecture
 
@@ -389,14 +478,35 @@ lp2p_host_dial(host, "/ip4/1.2.3.4/tcp/9000/p2p/12D3KooW...", on_dial, NULL);
 
 ## Running Tests
 
+TCP-only build:
+
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
+cmake -B build -DCMAKE_BUILD_TYPE=Debug -DLP2P_ENABLE_QUIC=OFF
 cmake --build build --parallel $(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
+QUIC-enabled build:
+
+```bash
+export WORKDIR=~/c-libp2p-deps
+
+cmake -B build-quic \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DLP2P_ENABLE_QUIC=ON \
+    -DLP2P_BUILD_TESTS=ON \
+    -DNGTCP2_ROOT=$WORKDIR/ngtcp2 \
+    -DOPENSSL_INCLUDE_DIR=$WORKDIR/boringssl/include \
+    -DOPENSSL_SSL_LIBRARY=$WORKDIR/boringssl/build/libssl.a \
+    -DOPENSSL_CRYPTO_LIBRARY=$WORKDIR/boringssl/build/libcrypto.a \
+    -DOPENSSL_VERSION=1.1.1
+cmake --build build-quic --parallel $(nproc)
+ctest --test-dir build-quic --output-on-failure
+```
+
 The test suite covers varint encoding, multiaddr parsing, peer IDs, Noise
-handshake, Yamux, Ping, Identify, TCP transport, and integration scenarios.
+handshake, Yamux, Ping, Identify, TCP transport, QUIC transport, and
+integration scenarios.
 
 ## Known Issues and Notes
 

@@ -32,11 +32,15 @@ const (
 var (
 	defaultServerListen = []string{
 		"/ip4/0.0.0.0/tcp/4001",
+		"/ip4/0.0.0.0/udp/4001/quic-v1",
 		"/ip6/::/tcp/4001",
+		"/ip6/::/udp/4001/quic-v1",
 	}
 	defaultClientListen = []string{
 		"/ip4/0.0.0.0/tcp/0",
+		"/ip4/0.0.0.0/udp/0/quic-v1",
 		"/ip6/::/tcp/0",
+		"/ip6/::/udp/0/quic-v1",
 	}
 )
 

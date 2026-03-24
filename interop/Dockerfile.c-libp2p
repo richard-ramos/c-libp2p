@@ -15,18 +15,28 @@ RUN apt-get update \
         protobuf-c-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
+COPY boringssl/ /deps/boringssl/
+COPY ngtcp2/ /deps/ngtcp2/
 
-COPY CMakeLists.txt ./
-COPY cmake/ cmake/
-COPY examples/ examples/
-COPY include/ include/
-COPY proto/ proto/
-COPY src/ src/
+WORKDIR /src/c-libp2p
+
+COPY c-libp2p/CMakeLists.txt ./
+COPY c-libp2p/cmake/ cmake/
+COPY c-libp2p/examples/ examples/
+COPY c-libp2p/include/ include/
+COPY c-libp2p/proto/ proto/
+COPY c-libp2p/src/ src/
 
 RUN cmake -B build \
         -DCMAKE_BUILD_TYPE=Release \
         -DLP2P_BUILD_TESTS=OFF \
-        -DLP2P_ENABLE_QUIC=OFF \
-    && cmake --build build --parallel "$(nproc)" --target example_ping_peer \
+        -DLP2P_ENABLE_QUIC=ON \
+        -DCMAKE_EXE_LINKER_FLAGS=-no-pie \
+        -DNGTCP2_ROOT=/deps/ngtcp2 \
+        -DOPENSSL_INCLUDE_DIR=/deps/boringssl/include \
+        -DOPENSSL_SSL_LIBRARY=/deps/boringssl/build/libssl.a \
+        -DOPENSSL_CRYPTO_LIBRARY=/deps/boringssl/build/libcrypto.a \
+        -DOPENSSL_VERSION=1.1.1 \
+    && cmake --build build --parallel "$(nproc)" --target example_ping_peer example_echo_client \
     && install -m 0755 build/example_ping_peer /usr/local/bin/ping_peer
+RUN install -m 0755 build/example_echo_client /usr/local/bin/echo_client

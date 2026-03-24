@@ -108,7 +108,7 @@ target_link_libraries(lp2p
 )
 if(LP2P_ENABLE_QUIC)
     target_include_directories(lp2p PRIVATE ${NGTCP2_INCLUDE_DIRS})
-    target_link_libraries(lp2p PUBLIC ${NGTCP2_LIBRARIES})
+    target_link_libraries(lp2p PUBLIC ${NGTCP2_LIBRARIES} stdc++)
     target_compile_definitions(lp2p PUBLIC LP2P_HAVE_QUIC=1)
 endif()
 
@@ -133,6 +133,10 @@ if(LP2P_BUILD_TESTS)
         tests/test_integration.c
         tests/test_custom_protocol.c
     )
+
+    if(LP2P_ENABLE_QUIC)
+        list(APPEND TEST_SOURCES tests/test_quic_transport.c)
+    endif()
 
     foreach(test_src ${TEST_SOURCES})
         get_filename_component(test_name ${test_src} NAME_WE)

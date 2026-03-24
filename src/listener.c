@@ -1,20 +1,16 @@
 /* src/listener.c — inbound connection acceptance, triggers connection pipeline */
 
 #include "listener.h"
-#include "transport/tcp/tcp_transport.h"
 #include <stdlib.h>
 #include <string.h>
 
 /* ── on_conn callback from the transport layer ────────────────────────────── */
-static void listener_on_transport_conn(void *transport, lp2p_conn_t *conn)
+static void listener_on_transport_conn(void *transport, lp2p_conn_t *conn,
+                                        void *userdata)
 {
-    /* The transport passes us a raw TCP connection (cast as lp2p_conn_t*).
-       We forward it to whoever registered with the listener. */
-    lp2p_tcp_transport_t *impl = (lp2p_tcp_transport_t *)transport;
-
-    /* Walk back to our listener via the transport's userdata.
-       We stored the listener pointer in on_conn_ud. */
-    lp2p_listener_t *listener = (lp2p_listener_t *)impl->on_conn_ud;
+    /* The transport passes back the listener as userdata. */
+    lp2p_listener_t *listener = (lp2p_listener_t *)userdata;
+    (void)transport;
     if (listener && listener->on_conn) {
         listener->on_conn(listener, conn, listener->on_conn_ud);
     }

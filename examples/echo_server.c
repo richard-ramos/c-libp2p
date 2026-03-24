@@ -15,6 +15,7 @@
 #define ECHO_MAX_READ 65536 /* 64 KiB */
 
 static lp2p_host_t *g_host;
+static const char *g_listen_addr = LISTEN_ADDR;
 
 /* Forward declarations */
 static void echo_read_cb(lp2p_stream_t *stream, lp2p_err_t err,
@@ -80,7 +81,7 @@ static void on_listen(lp2p_err_t err, void *userdata)
 
     printf("Echo server started\n");
     printf("Peer ID: %s\n", pid_str);
-    printf("Listening on: %s/p2p/%s\n", LISTEN_ADDR, pid_str);
+    printf("Listening on: %s/p2p/%s\n", g_listen_addr, pid_str);
 }
 
 /* ── Signal handler ──────────────────────────────────────────────────────── */
@@ -93,9 +94,20 @@ static void on_signal(uv_signal_t *handle, int signum)
     lp2p_host_close(g_host, NULL, NULL);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
     uv_loop_t *loop = uv_default_loop();
+
+    if (argc > 2) {
+        fprintf(stderr, "Usage: %s [listen-multiaddr]\n", argv[0]);
+        fprintf(stderr, "  e.g. %s %s\n", argv[0], LISTEN_ADDR);
+        fprintf(stderr, "  e.g. %s /ip4/127.0.0.1/udp/9000/quic-v1\n", argv[0]);
+        return 1;
+    }
+
+    if (argc == 2) {
+        g_listen_addr = argv[1];
+    }
 
     /* Generate identity */
     lp2p_keypair_t *kp = NULL;
@@ -106,7 +118,7 @@ int main(void)
     }
 
     /* Configure host */
-    const char *addrs[] = { LISTEN_ADDR };
+    const char *addrs[] = { g_listen_addr };
     lp2p_host_config_t cfg = {
         .keypair            = kp,
         .listen_addrs       = addrs,

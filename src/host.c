@@ -37,12 +37,15 @@
 
 static void host_on_inbound_raw_conn(lp2p_listener_t *listener, lp2p_conn_t *conn,
                                      void *userdata);
+static void host_on_inbound_ready_conn(lp2p_listener_t *listener, lp2p_conn_t *conn,
+                                       void *userdata);
 static void host_on_new_stream(lp2p_stream_t *stream, void *userdata);
 static void host_fire_conn_callbacks(lp2p_host_t *host, lp2p_conn_t *conn);
 static void host_fire_disconn_callbacks(lp2p_host_t *host, lp2p_conn_t *conn,
                                           lp2p_err_t reason);
 static void dial_done(lp2p_conn_t *conn, lp2p_err_t err, void *userdata);
 static void host_on_raw_dial_conn(lp2p_conn_t *conn, lp2p_err_t err, void *userdata);
+static void host_on_ready_dial_conn(lp2p_conn_t *conn, lp2p_err_t err, void *userdata);
 static void host_on_upgraded_ready(lp2p_conn_t *conn, void *userdata);
 static void host_on_upgraded_disconnect(lp2p_conn_t *conn, lp2p_err_t reason,
                                         void *userdata);
@@ -52,6 +55,11 @@ static void host_conn_destroy_done(lp2p_conn_t *conn, void *userdata);
 static void host_pending_conn_close_done(lp2p_conn_t *conn, void *userdata);
 static void host_live_conn_close_done(lp2p_conn_t *conn, void *userdata);
 static void host_finish_inbound_conn(lp2p_host_t *host, lp2p_conn_t *conn);
+static void host_prepare_ready_conn(lp2p_host_t *host, lp2p_conn_t *conn);
+static lp2p_transport_t *host_transport_for_addr(lp2p_host_t *host,
+                                                 const lp2p_multiaddr_t *addr);
+static lp2p_dialer_t *host_dialer_for_addr(lp2p_host_t *host,
+                                           const lp2p_multiaddr_t *addr);
 
 static bool host_conn_has_peer_id(const lp2p_conn_t *conn) {
     return conn && lp2p_conn_peer_id(conn).len > 0;
@@ -113,6 +121,15 @@ lp2p_err_t lp2p_host_new(uv_loop_t *loop, const lp2p_host_config_t *config,
                             &h->dialer);
     if (err != LP2P_OK) goto fail;
 
+#ifdef LP2P_HAVE_QUIC
+    err = lp2p_quic_transport_new(loop, h->keypair, &h->quic_transport);
+    if (err != LP2P_OK) goto fail;
+
+    err = lp2p_dialer_new(loop, h->quic_transport, h->config.dial_timeout_ms,
+                          &h->quic_dialer);
+    if (err != LP2P_OK) goto fail;
+#endif
+
     /* Register built-in protocol handlers */
     lp2p_protocol_router_add(h->router, PING_PROTOCOL_ID,
                               lp2p_ping_handler, h);
@@ -153,10 +170,14 @@ void lp2p_host_free(lp2p_host_t *host) {
         lp2p_multiaddr_free(host->listen_mas[i]);
     }
 
+    if (host->connmgr)   lp2p_connmgr_free(host->connmgr);
     if (host->dialer)    lp2p_dialer_free(host->dialer);
+#ifdef LP2P_HAVE_QUIC
+    if (host->quic_dialer)    lp2p_dialer_free(host->quic_dialer);
+    if (host->quic_transport) lp2p_quic_transport_free(host->quic_transport);
+#endif
     if (host->transport) lp2p_tcp_transport_free(host->transport);
     if (host->router)    lp2p_protocol_router_free(host->router);
-    if (host->connmgr)   lp2p_connmgr_free(host->connmgr);
     if (host->peerstore) lp2p_peerstore_free(host->peerstore);
     if (host->keypair)   lp2p_keypair_free(host->keypair);
 
@@ -247,15 +268,25 @@ lp2p_err_t lp2p_host_listen(lp2p_host_t *host, lp2p_on_listen_cb cb,
     lp2p_err_t first_err = LP2P_OK;
 
     for (size_t i = 0; i < host->listen_addrs_count; i++) {
+        lp2p_transport_t *transport = host_transport_for_addr(host, host->listen_mas[i]);
+        if (!transport) {
+            if (first_err == LP2P_OK) first_err = LP2P_ERR_TRANSPORT;
+            continue;
+        }
+
         lp2p_listener_t *listener = NULL;
-        lp2p_err_t err = lp2p_listener_new(host->loop, host->transport,
-                                             host->listen_mas[i], &listener);
+        lp2p_err_t err = lp2p_listener_new(host->loop, transport,
+                                           host->listen_mas[i], &listener);
         if (err != LP2P_OK) {
             if (first_err == LP2P_OK) first_err = err;
             continue;
         }
 
-        err = lp2p_listener_start(listener, host_on_inbound_raw_conn, host);
+        err = lp2p_listener_start(listener,
+                                  transport == host->transport ?
+                                      host_on_inbound_raw_conn :
+                                      host_on_inbound_ready_conn,
+                                  host);
         if (err != LP2P_OK) {
             lp2p_listener_free(listener);
             if (first_err == LP2P_OK) first_err = err;
@@ -332,11 +363,7 @@ static void host_on_upgraded_ready(lp2p_conn_t *conn, void *userdata) {
     host_pending_conn_ctx_t *ctx = userdata;
     if (!ctx || !conn) return;
 
-    conn->host = ctx->host;
-    conn->on_disconnect = host_on_live_disconnect;
-    conn->cb_userdata = ctx->host;
-    conn->close_cb.cb = host_live_conn_close_done;
-    conn->close_cb.userdata = ctx->host;
+    host_prepare_ready_conn(ctx->host, conn);
 
     if (ctx->dial_ctx) {
         dial_done(conn, LP2P_OK, ctx->dial_ctx);
@@ -402,6 +429,19 @@ static void host_on_raw_dial_conn(lp2p_conn_t *conn, lp2p_err_t err, void *userd
         if (ctx->cb) ctx->cb(NULL, uerr, ctx->userdata);
         free(ctx);
     }
+}
+
+static void host_on_ready_dial_conn(lp2p_conn_t *conn, lp2p_err_t err, void *userdata) {
+    dial_ctx_t *ctx = userdata;
+
+    if (err != LP2P_OK || !conn) {
+        if (ctx && ctx->cb) ctx->cb(NULL, err, ctx->userdata);
+        free(ctx);
+        return;
+    }
+
+    host_prepare_ready_conn(ctx->host, conn);
+    dial_done(conn, LP2P_OK, ctx);
 }
 
 static void dial_done(lp2p_conn_t *conn, lp2p_err_t err, void *userdata) {
@@ -501,8 +541,19 @@ lp2p_err_t lp2p_host_dial(lp2p_host_t *host, const char *multiaddr,
         ctx->has_expected_peer = true;
     }
 
+    lp2p_dialer_t *dialer = host_dialer_for_addr(host, ma);
+    if (!dialer) {
+        free(ctx);
+        lp2p_multiaddr_free(ma);
+        return LP2P_ERR_TRANSPORT;
+    }
+
     /* Dial via the dialer */
-    err = lp2p_dialer_dial(host->dialer, ma, host_on_raw_dial_conn, ctx);
+    err = lp2p_dialer_dial(dialer, ma,
+                           dialer == host->dialer ?
+                               host_on_raw_dial_conn :
+                               host_on_ready_dial_conn,
+                           ctx);
     lp2p_multiaddr_free(ma);
 
     if (err != LP2P_OK) {
@@ -787,6 +838,74 @@ static void host_on_inbound_raw_conn(lp2p_listener_t *listener, lp2p_conn_t *con
     }
 
     (void)host_upgrade_raw_conn(host, (lp2p_tcp_conn_t *)conn, true, NULL);
+}
+
+static void host_on_inbound_ready_conn(lp2p_listener_t *listener, lp2p_conn_t *conn,
+                                       void *userdata) {
+    lp2p_host_t *host = userdata;
+    (void)listener;
+
+    if (!conn || !host || host->closing) {
+        if (conn) {
+            lp2p_conn_close(conn, host_conn_destroy_done, NULL);
+        }
+        return;
+    }
+
+    host_prepare_ready_conn(host, conn);
+    host_finish_inbound_conn(host, conn);
+}
+
+static void host_prepare_ready_conn(lp2p_host_t *host, lp2p_conn_t *conn) {
+    if (!host || !conn) return;
+
+    conn->host = host;
+    lp2p_conn_set_protocol_router(conn, host->router);
+    conn->on_disconnect = host_on_live_disconnect;
+    conn->cb_userdata = host;
+    conn->close_cb.cb = host_live_conn_close_done;
+    conn->close_cb.userdata = host;
+}
+
+static lp2p_transport_t *host_transport_for_addr(lp2p_host_t *host,
+                                                 const lp2p_multiaddr_t *addr) {
+    if (!host || !addr) return NULL;
+
+    if (host->transport &&
+        host->transport->vtable->handles(host->transport->impl, addr)) {
+        return host->transport;
+    }
+
+#ifdef LP2P_HAVE_QUIC
+    if (host->quic_transport &&
+        host->quic_transport->vtable->handles(host->quic_transport->impl, addr)) {
+        return host->quic_transport;
+    }
+#endif
+
+    return NULL;
+}
+
+static lp2p_dialer_t *host_dialer_for_addr(lp2p_host_t *host,
+                                           const lp2p_multiaddr_t *addr) {
+    if (!host || !addr) return NULL;
+
+    if (host->dialer &&
+        host->dialer->transport &&
+        host->dialer->transport->vtable->handles(host->dialer->transport->impl, addr)) {
+        return host->dialer;
+    }
+
+#ifdef LP2P_HAVE_QUIC
+    if (host->quic_dialer &&
+        host->quic_dialer->transport &&
+        host->quic_dialer->transport->vtable->handles(host->quic_dialer->transport->impl,
+                                                      addr)) {
+        return host->quic_dialer;
+    }
+#endif
+
+    return NULL;
 }
 
 /* ── Inbound stream handling (called by mux layer) ───────────────────────── */

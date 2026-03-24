@@ -2,7 +2,10 @@
 
 #include "quic_transport.h"
 #include "quic_tls.h"
+#include "connmgr_internal.h"
+#include "connection_internal.h"
 #include "crypto/keypair_internal.h"
+#include "encoding/varint.h"
 #include "libp2p/crypto.h"
 #include "libp2p/multiaddr.h"
 
@@ -37,6 +40,15 @@
 #define QUIC_MAX_PKTLEN      1200
 #define QUIC_STREAM_BUF_INIT 4096
 #define QUIC_SCID_LEN        18
+#define QUIC_APP_ERR_RESET   1
+
+struct quic_write_chunk {
+    struct quic_write_chunk *next;
+    uint8_t                 *data;
+    size_t                   len;
+    size_t                   offset;
+    bool                     fin;
+};
 
 /* quic_now() was removed in newer ngtcp2 versions; use CLOCK_MONOTONIC */
 static ngtcp2_tstamp quic_now(void) {
@@ -59,7 +71,8 @@ static const char TLS_SIG_PREFIX[] = "libp2p-tls-handshake:";
  * ════════════════════════════════════════════════════════════════════════════ */
 
 static lp2p_err_t quic_listen(void *transport, const lp2p_multiaddr_t *addr,
-                               void (*on_conn)(void *transport, lp2p_conn_t *conn),
+                               void (*on_conn)(void *transport, lp2p_conn_t *conn,
+                                               void *userdata),
                                void *userdata);
 static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
                               void (*on_conn)(lp2p_conn_t *conn, lp2p_err_t err, void *userdata),
@@ -72,6 +85,20 @@ static void quic_conn_schedule_timer(quic_conn_t *qc);
 static void quic_conn_free(quic_conn_t *qc);
 static quic_stream_t *quic_conn_find_stream(quic_conn_t *qc, int64_t stream_id);
 static quic_stream_t *quic_conn_create_stream(quic_conn_t *qc, int64_t stream_id);
+static void quic_stream_deliver_data(quic_stream_t *qs);
+static void quic_stream_maybe_notify(quic_stream_t *qs);
+static bool quic_stream_is_remote_initiated(const quic_conn_t *qc, int64_t stream_id);
+static void quic_conn_remove(quic_conn_t *qc);
+static bool sockaddr_to_quic_multiaddr(const struct sockaddr_storage *addr,
+                                       const lp2p_peer_id_t *peer_id,
+                                       lp2p_multiaddr_t **out);
+static void quic_stream_free(quic_stream_t *qs);
+static void quic_transport_maybe_close_udp(quic_transport_t *qt);
+static void udp_close_cb(uv_handle_t *handle);
+static ngtcp2_conn *quic_crypto_get_conn(ngtcp2_crypto_conn_ref *conn_ref);
+static bool quic_conn_track_local_cid(quic_conn_t *qc, const ngtcp2_cid *cid);
+static bool quic_conn_matches_local_cid(const quic_conn_t *qc,
+                                        const uint8_t *data, size_t datalen);
 
 static const lp2p_transport_vtable_t quic_vtable = {
     .listen  = quic_listen,
@@ -694,6 +721,18 @@ lp2p_err_t quic_tls_create_ssl_ctx(const lp2p_keypair_t *identity_key,
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
     SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
 
+    if (is_server) {
+        if (ngtcp2_crypto_boringssl_configure_server_context(ctx) != 0) {
+            SSL_CTX_free(ctx);
+            return LP2P_ERR_CRYPTO;
+        }
+    } else {
+        if (ngtcp2_crypto_boringssl_configure_client_context(ctx) != 0) {
+            SSL_CTX_free(ctx);
+            return LP2P_ERR_CRYPTO;
+        }
+    }
+
     /* Generate cert and key */
     EVP_PKEY *tls_key = NULL;
     X509 *cert = NULL;
@@ -746,10 +785,15 @@ static int get_new_connection_id_cb(ngtcp2_conn *conn, ngtcp2_cid *cid,
                                      void *user_data)
 {
     (void)conn;
-    (void)user_data;
     RAND_bytes(cid->data, (int)cidlen);
     cid->datalen = cidlen;
     RAND_bytes(token, NGTCP2_STATELESS_RESET_TOKENLEN);
+
+    quic_conn_t *qc = (quic_conn_t *)user_data;
+    if (qc && !quic_conn_track_local_cid(qc, cid)) {
+        return NGTCP2_ERR_NOMEM;
+    }
+
     return 0;
 }
 
@@ -775,22 +819,17 @@ static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags,
 
     /* Append data to stream recv buffer */
     if (datalen > 0) {
-        size_t needed = qs->recv_buf_len + datalen;
-        if (needed > qs->recv_buf_cap) {
-            size_t new_cap = qs->recv_buf_cap ? qs->recv_buf_cap * 2 : QUIC_STREAM_BUF_INIT;
-            while (new_cap < needed) new_cap *= 2;
-            uint8_t *nb = realloc(qs->recv_buf, new_cap);
-            if (!nb) return NGTCP2_ERR_CALLBACK_FAILURE;
-            qs->recv_buf = nb;
-            qs->recv_buf_cap = new_cap;
+        if (!lp2p_buffer_append(&qs->recv_buf, data, datalen)) {
+            return NGTCP2_ERR_CALLBACK_FAILURE;
         }
-        memcpy(qs->recv_buf + qs->recv_buf_len, data, datalen);
-        qs->recv_buf_len += datalen;
     }
 
     if (flags & NGTCP2_STREAM_DATA_FLAG_FIN) {
         qs->fin_received = true;
     }
+
+    quic_stream_maybe_notify(qs);
+    quic_stream_deliver_data(qs);
 
     ngtcp2_conn_extend_max_stream_offset(conn, stream_id, datalen);
     ngtcp2_conn_extend_max_offset(conn, datalen);
@@ -805,6 +844,8 @@ static int stream_open_cb(ngtcp2_conn *conn, int64_t stream_id, void *user_data)
 
     quic_stream_t *qs = quic_conn_create_stream(qc, stream_id);
     if (!qs) return NGTCP2_ERR_CALLBACK_FAILURE;
+
+    quic_stream_maybe_notify(qs);
 
     return 0;
 }
@@ -826,8 +867,24 @@ static int stream_close_cb(ngtcp2_conn *conn, uint32_t flags,
         if ((*pp)->stream_id == stream_id) {
             quic_stream_t *qs = *pp;
             *pp = qs->next;
-            free(qs->recv_buf);
-            free(qs);
+            if (qs->read_pending) {
+                if (qs->reset || app_error_code != NGTCP2_NO_ERROR) {
+                    lp2p_stream_read_cb cb = qs->read_cb;
+                    void *ud = qs->read_ud;
+                    qs->read_pending = false;
+                    qs->read_cb = NULL;
+                    qs->read_ud = NULL;
+                    if (cb) {
+                        cb(&qs->pub, LP2P_ERR_STREAM_RESET, NULL, ud);
+                    }
+                } else {
+                    quic_stream_deliver_data(qs);
+                }
+            }
+            if (qs->close_cb) {
+                qs->close_cb(&qs->pub, LP2P_OK, qs->close_ud);
+            }
+            quic_stream_free(qs);
             return 0;
         }
         pp = &(*pp)->next;
@@ -854,12 +911,25 @@ static int handshake_completed_cb(ngtcp2_conn *conn, void *user_data)
 
     qc->peer_id_verified = true;
     qc->state = QUIC_CONN_READY;
+    qc->pub_conn->remote_peer = qc->remote_peer_id;
+    qc->pub_conn->state = CONN_STATE_READY;
+
+    if (!qc->pub_conn->remote_addr) {
+        (void)sockaddr_to_quic_multiaddr(&qc->remote_addr, &qc->remote_peer_id,
+                                         &qc->pub_conn->remote_addr);
+    }
+    if (!qc->pub_conn->local_addr) {
+        (void)sockaddr_to_quic_multiaddr(&qc->local_addr, NULL,
+                                         &qc->pub_conn->local_addr);
+    }
+
+    lp2p_quic_conn_notify_pending_streams(qc->pub_conn);
 
     /* Notify the callback */
     if (qc->is_server && qc->on_inbound_cb) {
-        qc->on_inbound_cb(qc->transport, (lp2p_conn_t *)qc);
+        qc->on_inbound_cb(qc->transport, qc->pub_conn, qc->on_inbound_ud);
     } else if (!qc->is_server && qc->on_conn_cb) {
-        qc->on_conn_cb((lp2p_conn_t *)qc, LP2P_OK, qc->on_conn_ud);
+        qc->on_conn_cb(qc->pub_conn, LP2P_OK, qc->on_conn_ud);
         qc->on_conn_cb = NULL;
     }
 
@@ -946,8 +1016,141 @@ static ngtcp2_transport_params make_transport_params(bool is_server)
     if (is_server) {
         RAND_bytes(params.original_dcid.data, QUIC_SCID_LEN);
         params.original_dcid.datalen = QUIC_SCID_LEN;
+        params.original_dcid_present = 1;
     }
     return params;
+}
+
+static void quic_conn_remove(quic_conn_t *qc)
+{
+    if (!qc || !qc->transport) return;
+
+    quic_conn_t **pp = &qc->transport->conns;
+    while (*pp) {
+        if (*pp == qc) {
+            *pp = qc->next;
+            qc->next = NULL;
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+static bool quic_conn_track_local_cid(quic_conn_t *qc, const ngtcp2_cid *cid)
+{
+    if (!qc || !cid || cid->datalen == 0) return false;
+
+    for (quic_local_cid_t *it = qc->local_cids; it; it = it->next) {
+        if (it->cid.datalen == cid->datalen &&
+            memcmp(it->cid.data, cid->data, cid->datalen) == 0) {
+            return true;
+        }
+    }
+
+    quic_local_cid_t *entry = calloc(1, sizeof(*entry));
+    if (!entry) return false;
+
+    memcpy(&entry->cid, cid, sizeof(*cid));
+    entry->next = qc->local_cids;
+    qc->local_cids = entry;
+    return true;
+}
+
+static bool quic_conn_matches_local_cid(const quic_conn_t *qc,
+                                        const uint8_t *data, size_t datalen)
+{
+    if (!qc || !data || datalen == 0) return false;
+
+    ngtcp2_version_cid vc;
+    if (ngtcp2_pkt_decode_version_cid(&vc, data, datalen, QUIC_SCID_LEN) != 0) {
+        return false;
+    }
+
+    for (const quic_local_cid_t *it = qc->local_cids; it; it = it->next) {
+        if (it->cid.datalen == vc.dcidlen &&
+            memcmp(it->cid.data, vc.dcid, vc.dcidlen) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool sockaddr_to_quic_multiaddr(const struct sockaddr_storage *addr,
+                                       const lp2p_peer_id_t *peer_id,
+                                       lp2p_multiaddr_t **out)
+{
+    if (!addr || !out) return false;
+
+    char ip[INET6_ADDRSTRLEN];
+    uint16_t port = 0;
+    const char *proto = NULL;
+
+    if (addr->ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
+        if (uv_inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip)) != 0) {
+            return false;
+        }
+        port = ntohs(sin->sin_port);
+        proto = "ip4";
+    } else if (addr->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)addr;
+        if (uv_inet_ntop(AF_INET6, &sin6->sin6_addr, ip, sizeof(ip)) != 0) {
+            return false;
+        }
+        port = ntohs(sin6->sin6_port);
+        proto = "ip6";
+    } else {
+        return false;
+    }
+
+    char ma_str[512];
+    if (peer_id && peer_id->len > 0) {
+        char peer[128];
+        size_t peer_len = sizeof(peer);
+        if (lp2p_peer_id_to_string(peer_id, peer, &peer_len) != LP2P_OK) {
+            return false;
+        }
+        snprintf(ma_str, sizeof(ma_str), "/%s/%s/udp/%u/quic-v1/p2p/%s",
+                 proto, ip, port, peer);
+    } else {
+        snprintf(ma_str, sizeof(ma_str), "/%s/%s/udp/%u/quic-v1",
+                 proto, ip, port);
+    }
+
+    return lp2p_multiaddr_parse(ma_str, out) == LP2P_OK;
+}
+
+static void quic_stream_free(quic_stream_t *qs)
+{
+    if (!qs) return;
+
+    free(qs->pub.protocol_id);
+    lp2p_buffer_free(&qs->recv_buf);
+
+    quic_write_chunk_t *chunk = qs->send_head;
+    while (chunk) {
+        quic_write_chunk_t *next = chunk->next;
+        free(chunk->data);
+        free(chunk);
+        chunk = next;
+    }
+
+    chunk = qs->retained_head;
+    while (chunk) {
+        quic_write_chunk_t *next = chunk->next;
+        free(chunk->data);
+        free(chunk);
+        chunk = next;
+    }
+
+    free(qs);
+}
+
+static ngtcp2_conn *quic_crypto_get_conn(ngtcp2_crypto_conn_ref *conn_ref)
+{
+    if (!conn_ref || !conn_ref->user_data) return NULL;
+    return ((quic_conn_t *)conn_ref->user_data)->conn;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -966,11 +1169,173 @@ static quic_stream_t *quic_conn_create_stream(quic_conn_t *qc, int64_t stream_id
 {
     quic_stream_t *qs = calloc(1, sizeof(*qs));
     if (!qs) return NULL;
+    lp2p_buffer_init(&qs->recv_buf);
     qs->stream_id = stream_id;
     qs->qconn = qc;
+    qs->pub.conn = qc->pub_conn;
     qs->next = qc->streams;
     qc->streams = qs;
     return qs;
+}
+
+static bool quic_stream_is_remote_initiated(const quic_conn_t *qc, int64_t stream_id)
+{
+    /* Bidirectional stream IDs:
+     *   client-initiated: 0 mod 4
+     *   server-initiated: 1 mod 4
+     */
+    int64_t kind = stream_id & 0x3;
+    if (kind != 0 && kind != 1) {
+        return false;
+    }
+
+    return qc->is_server ? (kind == 0) : (kind == 1);
+}
+
+static void quic_stream_consume_recv(quic_stream_t *qs, size_t n)
+{
+    if (n >= qs->recv_buf.len) {
+        qs->recv_buf.len = 0;
+        return;
+    }
+
+    memmove(qs->recv_buf.data, qs->recv_buf.data + n, qs->recv_buf.len - n);
+    qs->recv_buf.len -= n;
+}
+
+static void quic_stream_deliver_eof(quic_stream_t *qs)
+{
+    lp2p_stream_read_cb cb = qs->read_cb;
+    void *ud = qs->read_ud;
+
+    qs->read_pending = false;
+    qs->read_cb = NULL;
+    qs->read_ud = NULL;
+
+    if (cb) {
+        cb(&qs->pub, LP2P_ERR_EOF, NULL, ud);
+    }
+}
+
+static void quic_stream_deliver_data(quic_stream_t *qs)
+{
+    if (!qs || !qs->read_pending) return;
+
+    if (qs->reset) {
+        lp2p_stream_read_cb cb = qs->read_cb;
+        void *ud = qs->read_ud;
+        qs->read_pending = false;
+        qs->read_cb = NULL;
+        qs->read_ud = NULL;
+        if (cb) {
+            cb(&qs->pub, LP2P_ERR_STREAM_RESET, NULL, ud);
+        }
+        return;
+    }
+
+    if (qs->read_lp) {
+        uint64_t frame_len = 0;
+        size_t varint_len = lp2p_varint_decode(qs->recv_buf.data, qs->recv_buf.len, &frame_len);
+        if (varint_len == 0) {
+            if (qs->fin_received && qs->recv_buf.len == 0) {
+                quic_stream_deliver_eof(qs);
+            }
+            return;
+        }
+
+        if (frame_len > qs->read_max) {
+            lp2p_stream_read_cb cb = qs->read_cb;
+            void *ud = qs->read_ud;
+            qs->read_pending = false;
+            qs->read_cb = NULL;
+            qs->read_ud = NULL;
+            if (cb) {
+                cb(&qs->pub, LP2P_ERR_PROTOCOL, NULL, ud);
+            }
+            return;
+        }
+
+        size_t total = varint_len + (size_t)frame_len;
+        if (qs->recv_buf.len < total) {
+            if (qs->fin_received && qs->recv_buf.len == 0) {
+                quic_stream_deliver_eof(qs);
+            }
+            return;
+        }
+
+        lp2p_stream_read_cb cb = qs->read_cb;
+        void *ud = qs->read_ud;
+        uint8_t *copy = NULL;
+        lp2p_buf_t buf = { .len = (size_t)frame_len };
+
+        if (buf.len > 0) {
+            copy = malloc(buf.len);
+            if (!copy) {
+                cb(&qs->pub, LP2P_ERR_NOMEM, NULL, ud);
+                qs->read_pending = false;
+                qs->read_cb = NULL;
+                qs->read_ud = NULL;
+                return;
+            }
+            memcpy(copy, qs->recv_buf.data + varint_len, buf.len);
+        }
+        buf.data = copy;
+
+        qs->read_pending = false;
+        qs->read_cb = NULL;
+        qs->read_ud = NULL;
+        quic_stream_consume_recv(qs, total);
+        if (cb) {
+            cb(&qs->pub, LP2P_OK, &buf, ud);
+        }
+        free(copy);
+        return;
+    }
+
+    if (qs->recv_buf.len > 0) {
+        size_t n = qs->recv_buf.len < qs->read_max ? qs->recv_buf.len : qs->read_max;
+        lp2p_stream_read_cb cb = qs->read_cb;
+        void *ud = qs->read_ud;
+        uint8_t *copy = malloc(n);
+        if (!copy) {
+            qs->read_pending = false;
+            qs->read_cb = NULL;
+            qs->read_ud = NULL;
+            if (cb) {
+                cb(&qs->pub, LP2P_ERR_NOMEM, NULL, ud);
+            }
+            return;
+        }
+        memcpy(copy, qs->recv_buf.data, n);
+        lp2p_buf_t buf = { .data = copy, .len = n };
+
+        qs->read_pending = false;
+        qs->read_cb = NULL;
+        qs->read_ud = NULL;
+        quic_stream_consume_recv(qs, n);
+        if (cb) {
+            cb(&qs->pub, LP2P_OK, &buf, ud);
+        }
+        free(copy);
+        return;
+    }
+
+    if (qs->fin_received) {
+        quic_stream_deliver_eof(qs);
+    }
+}
+
+static void quic_stream_maybe_notify(quic_stream_t *qs)
+{
+    if (!qs || qs->inbound_notified) return;
+    if (!qs->qconn || !qs->qconn->pub_conn) return;
+    if (!quic_stream_is_remote_initiated(qs->qconn, qs->stream_id)) return;
+
+    lp2p_conn_t *conn = qs->qconn->pub_conn;
+    if (conn->state != CONN_STATE_READY || !conn->router) return;
+
+    qs->inbound_notified = true;
+    lp2p_conn_handle_inbound_stream(conn, &qs->pub);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -989,6 +1354,41 @@ static void udp_send_cb(uv_udp_send_t *req, int status)
     free(ctx);
 }
 
+static bool quic_send_packet(quic_conn_t *qc, const uint8_t *data, size_t len)
+{
+    if (!qc || !qc->transport || !qc->transport->udp_initialized || len == 0) {
+        return false;
+    }
+
+    udp_send_ctx_t *ctx = malloc(sizeof(*ctx) + len);
+    if (!ctx) return false;
+
+    memcpy(ctx->data, data, len);
+
+    uv_buf_t buf = uv_buf_init((char *)ctx->data, (unsigned int)len);
+    const struct sockaddr *dest = (const struct sockaddr *)&qc->remote_addr;
+    int r = uv_udp_send(&ctx->req, &qc->transport->udp_server, &buf, 1, dest, udp_send_cb);
+    if (r != 0) {
+        free(ctx);
+        return false;
+    }
+
+    return true;
+}
+
+static void quic_transport_maybe_close_udp(quic_transport_t *qt)
+{
+    if (!qt || !qt->udp_initialized || qt->listening || qt->conns) {
+        return;
+    }
+
+    uv_udp_recv_stop(&qt->udp_server);
+    if (!uv_is_closing((uv_handle_t *)&qt->udp_server)) {
+        uv_close((uv_handle_t *)&qt->udp_server, udp_close_cb);
+    }
+    qt->udp_initialized = false;
+}
+
 static void quic_conn_write_packets(quic_conn_t *qc)
 {
     if (!qc->conn || qc->state == QUIC_CONN_CLOSED) return;
@@ -1000,42 +1400,252 @@ static void quic_conn_write_packets(quic_conn_t *qc)
     ngtcp2_tstamp ts = quic_now();
 
     for (;;) {
-        ngtcp2_vec datav;
         int64_t stream_id = -1;
-        int fin = 0;
+        const uint8_t *data = NULL;
+        size_t data_len = 0;
+        uint32_t flags = 0;
+        quic_stream_t *send_stream = NULL;
+        quic_write_chunk_t *chunk = NULL;
 
-        ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
+        for (quic_stream_t *qs = qc->streams; qs; qs = qs->next) {
+            if (!qs->send_head) continue;
+            send_stream = qs;
+            chunk = qs->send_head;
+            stream_id = qs->stream_id;
+            data = chunk->data ? chunk->data + chunk->offset : NULL;
+            data_len = chunk->len - chunk->offset;
+            if (chunk->fin) {
+                flags |= NGTCP2_WRITE_STREAM_FLAG_FIN;
+            }
+            break;
+        }
+
+        ngtcp2_ssize pdatalen = -1;
+        ngtcp2_ssize nwrite = ngtcp2_conn_write_stream(
             qc->conn, &ps.path, &pi,
             qc->send_buf, sizeof(qc->send_buf),
-            NULL, /* pdatalen */
-            NGTCP2_WRITE_STREAM_FLAG_MORE,
-            stream_id, &datav, 0, ts);
+            &pdatalen,
+            flags,
+            stream_id, data, data_len, ts);
 
         if (nwrite < 0) {
             if (nwrite == NGTCP2_ERR_WRITE_MORE) continue;
+            if (nwrite == NGTCP2_ERR_STREAM_DATA_BLOCKED ||
+                nwrite == NGTCP2_ERR_STREAM_SHUT_WR ||
+                nwrite == NGTCP2_ERR_STREAM_NOT_FOUND) {
+                break;
+            }
             break;
         }
         if (nwrite == 0) break;
 
-        /* Send via UDP */
-        udp_send_ctx_t *ctx = malloc(sizeof(*ctx) + (size_t)nwrite);
-        if (!ctx) break;
-        memcpy(ctx->data, qc->send_buf, (size_t)nwrite);
+        if (send_stream && chunk && pdatalen >= 0) {
+            chunk->offset += (size_t)pdatalen;
+            if (chunk->offset >= chunk->len) {
+                send_stream->send_head = chunk->next;
+                if (!send_stream->send_head) {
+                    send_stream->send_tail = NULL;
+                }
+                chunk->next = send_stream->retained_head;
+                send_stream->retained_head = chunk;
+                if (chunk->fin) {
+                    send_stream->fin_sent = true;
+                }
+            }
+        }
 
-        uv_buf_t buf = uv_buf_init((char *)ctx->data, (unsigned int)nwrite);
-        const struct sockaddr *dest = (const struct sockaddr *)&qc->remote_addr;
-
-        /* Find the UDP handle: use the transport's server socket */
-        uv_udp_t *udp = &qc->transport->udp_server;
-
-        int r = uv_udp_send(&ctx->req, udp, &buf, 1, dest, udp_send_cb);
-        if (r != 0) {
-            free(ctx);
+        if (!quic_send_packet(qc, qc->send_buf, (size_t)nwrite)) {
             break;
         }
     }
 
     quic_conn_schedule_timer(qc);
+}
+
+lp2p_err_t lp2p_quic_conn_open_stream_raw(lp2p_conn_t *conn, lp2p_stream_t **out)
+{
+    if (!conn || !out) return LP2P_ERR_INVALID_ARG;
+    if (conn->backend != LP2P_CONN_BACKEND_QUIC || !conn->backend_impl) {
+        return LP2P_ERR_INVALID_ARG;
+    }
+    if (conn->state != CONN_STATE_READY) {
+        return LP2P_ERR_BUSY;
+    }
+
+    quic_conn_t *qc = (quic_conn_t *)conn->backend_impl;
+    int64_t stream_id = -1;
+    int rv = ngtcp2_conn_open_bidi_stream(qc->conn, &stream_id, NULL);
+    if (rv != 0) {
+        return rv == NGTCP2_ERR_STREAM_ID_BLOCKED ? LP2P_ERR_WOULD_BLOCK : LP2P_ERR_TRANSPORT;
+    }
+
+    quic_stream_t *qs = quic_conn_create_stream(qc, stream_id);
+    if (!qs) {
+        ngtcp2_conn_shutdown_stream(qc->conn, 0, stream_id, QUIC_APP_ERR_RESET);
+        quic_conn_write_packets(qc);
+        return LP2P_ERR_NOMEM;
+    }
+
+    *out = &qs->pub;
+    return LP2P_OK;
+}
+
+void lp2p_quic_conn_notify_pending_streams(lp2p_conn_t *conn)
+{
+    if (!conn || conn->backend != LP2P_CONN_BACKEND_QUIC || !conn->backend_impl) {
+        return;
+    }
+
+    quic_conn_t *qc = (quic_conn_t *)conn->backend_impl;
+    for (quic_stream_t *qs = qc->streams; qs; qs = qs->next) {
+        quic_stream_maybe_notify(qs);
+    }
+
+    if (conn->state != CONN_STATE_READY) {
+        return;
+    }
+
+    while (!lp2p_list_empty(&conn->pending_streams)) {
+        lp2p_list_node_t *n = lp2p_list_pop_front(&conn->pending_streams);
+        conn_open_stream_req_t *req = lp2p_container_of(n, conn_open_stream_req_t, node);
+
+        lp2p_err_t err = lp2p_conn_open_stream(conn, req->protocol_id, req->cb, req->userdata);
+        if (err != LP2P_OK && req->cb) {
+            req->cb(NULL, err, req->userdata);
+        }
+
+        free(req->protocol_id);
+        free(req);
+    }
+}
+
+lp2p_err_t lp2p_quic_stream_read(lp2p_stream_t *stream, size_t max_bytes,
+                                  lp2p_stream_read_cb cb, void *userdata)
+{
+    if (!stream || !cb) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_t *qs = (quic_stream_t *)stream;
+    if (qs->reset) return LP2P_ERR_STREAM_RESET;
+    if (qs->read_pending) return LP2P_ERR_BUSY;
+
+    if (qs->fin_received && qs->recv_buf.len == 0) {
+        cb(stream, LP2P_ERR_EOF, NULL, userdata);
+        return LP2P_OK;
+    }
+
+    qs->read_pending = true;
+    qs->read_lp = false;
+    qs->read_max = max_bytes;
+    qs->read_cb = cb;
+    qs->read_ud = userdata;
+    quic_stream_deliver_data(qs);
+    return LP2P_OK;
+}
+
+lp2p_err_t lp2p_quic_stream_read_lp(lp2p_stream_t *stream, size_t max_frame_len,
+                                     lp2p_stream_read_cb cb, void *userdata)
+{
+    if (!stream || !cb) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_t *qs = (quic_stream_t *)stream;
+    if (qs->reset) return LP2P_ERR_STREAM_RESET;
+    if (qs->read_pending) return LP2P_ERR_BUSY;
+
+    if (qs->fin_received && qs->recv_buf.len == 0) {
+        cb(stream, LP2P_ERR_EOF, NULL, userdata);
+        return LP2P_OK;
+    }
+
+    qs->read_pending = true;
+    qs->read_lp = true;
+    qs->read_max = max_frame_len;
+    qs->read_cb = cb;
+    qs->read_ud = userdata;
+    quic_stream_deliver_data(qs);
+    return LP2P_OK;
+}
+
+lp2p_err_t lp2p_quic_stream_write(lp2p_stream_t *stream, const lp2p_buf_t *buf,
+                                   lp2p_stream_write_cb cb, void *userdata)
+{
+    if (!stream || !buf || !buf->data) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_t *qs = (quic_stream_t *)stream;
+    quic_conn_t *qc = qs->qconn;
+    if (!qc || !qc->conn || qc->state == QUIC_CONN_CLOSED || qs->reset || qs->fin_sent) {
+        return LP2P_ERR_CONNECTION_CLOSED;
+    }
+
+    quic_write_chunk_t *chunk = calloc(1, sizeof(*chunk));
+    if (!chunk) return LP2P_ERR_NOMEM;
+
+    chunk->data = malloc(buf->len);
+    if (!chunk->data) {
+        free(chunk);
+        return LP2P_ERR_NOMEM;
+    }
+    memcpy(chunk->data, buf->data, buf->len);
+    chunk->len = buf->len;
+
+    if (qs->send_tail) {
+        qs->send_tail->next = chunk;
+    } else {
+        qs->send_head = chunk;
+    }
+    qs->send_tail = chunk;
+
+    quic_conn_write_packets(qc);
+    if (cb) cb(stream, LP2P_OK, userdata);
+    return LP2P_OK;
+}
+
+lp2p_err_t lp2p_quic_stream_close(lp2p_stream_t *stream, lp2p_stream_write_cb cb,
+                                   void *userdata)
+{
+    if (!stream) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_t *qs = (quic_stream_t *)stream;
+    quic_conn_t *qc = qs->qconn;
+    if (!qc || !qc->conn || qc->state == QUIC_CONN_CLOSED || qs->reset) {
+        return LP2P_ERR_CONNECTION_CLOSED;
+    }
+    if (qs->fin_sent) {
+        if (cb) cb(stream, LP2P_OK, userdata);
+        return LP2P_OK;
+    }
+
+    quic_write_chunk_t *chunk = calloc(1, sizeof(*chunk));
+    if (!chunk) return LP2P_ERR_NOMEM;
+    chunk->fin = true;
+    qs->fin_sent = true;
+
+    if (qs->send_tail) {
+        qs->send_tail->next = chunk;
+    } else {
+        qs->send_head = chunk;
+    }
+    qs->send_tail = chunk;
+
+    quic_conn_write_packets(qc);
+    if (cb) cb(stream, LP2P_OK, userdata);
+    return LP2P_OK;
+}
+
+lp2p_err_t lp2p_quic_stream_reset(lp2p_stream_t *stream)
+{
+    if (!stream) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_t *qs = (quic_stream_t *)stream;
+    quic_conn_t *qc = qs->qconn;
+    if (!qc || !qc->conn) return LP2P_ERR_INVALID_ARG;
+    if (qs->reset) return LP2P_OK;
+
+    qs->reset = true;
+    qs->fin_sent = true;
+    (void)ngtcp2_conn_shutdown_stream(qc->conn, 0, qs->stream_id, QUIC_APP_ERR_RESET);
+    quic_conn_write_packets(qc);
+    quic_stream_deliver_data(qs);
+    return LP2P_OK;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1051,11 +1661,42 @@ static void timer_cb(uv_timer_t *handle)
     int rv = ngtcp2_conn_handle_expiry(qc->conn, now);
     if (rv != 0) {
         /* Connection timed out or fatal error */
-        qc->state = QUIC_CONN_CLOSED;
         if (!qc->is_server && qc->on_conn_cb) {
-            qc->on_conn_cb(NULL, LP2P_ERR_TIMEOUT, qc->on_conn_ud);
+            void (*cb)(lp2p_conn_t *, lp2p_err_t, void *) = qc->on_conn_cb;
+            void *ud = qc->on_conn_ud;
             qc->on_conn_cb = NULL;
+            qc->state = QUIC_CONN_CLOSED;
+            cb(NULL, LP2P_ERR_TIMEOUT, ud);
+            if (qc->pub_conn) {
+                lp2p_conn_destroy(qc->pub_conn);
+            }
+            return;
         }
+
+        if (qc->pub_conn) {
+            lp2p_conn_t *conn = qc->pub_conn;
+            void (*on_disconnect)(lp2p_conn_t *, lp2p_err_t, void *) = conn->on_disconnect;
+            void *disconnect_ud = conn->cb_userdata;
+            void (*close_cb)(lp2p_conn_t *, void *) = conn->close_cb.cb;
+            void *close_ud = conn->close_cb.userdata;
+
+            conn->on_disconnect = NULL;
+            conn->close_cb.cb = NULL;
+            conn->close_cb.userdata = NULL;
+            conn->closing = true;
+            conn->state = CONN_STATE_CLOSED;
+            qc->state = QUIC_CONN_CLOSED;
+
+            if (on_disconnect) {
+                on_disconnect(conn, LP2P_ERR_TIMEOUT, disconnect_ud);
+            }
+            if (close_cb) {
+                close_cb(conn, close_ud);
+            }
+            return;
+        }
+
+        qc->state = QUIC_CONN_CLOSED;
         return;
     }
 
@@ -1088,14 +1729,8 @@ static void quic_conn_schedule_timer(quic_conn_t *qc)
 static quic_conn_t *find_conn_by_dcid(quic_transport_t *qt,
                                        const uint8_t *data, size_t datalen)
 {
-    /* Parse the QUIC packet header to extract the DCID */
-    ngtcp2_version_cid vc;
-    int rv = ngtcp2_pkt_decode_version_cid(&vc, data, datalen, QUIC_SCID_LEN);
-    if (rv != 0) return NULL;
-
     for (quic_conn_t *qc = qt->conns; qc; qc = qc->next) {
-        if (qc->scid.datalen == vc.dcidlen &&
-            memcmp(qc->scid.data, vc.dcid, vc.dcidlen) == 0) {
+        if (quic_conn_matches_local_cid(qc, data, datalen)) {
             return qc;
         }
     }
@@ -1133,6 +1768,16 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         qc->is_server = true;
         qc->state = QUIC_CONN_HANDSHAKING;
         qc->on_inbound_cb = qt->on_conn;
+        qc->on_inbound_ud = qt->on_conn_ud;
+
+        qc->pub_conn = lp2p_conn_new(qt->loop, true, NULL);
+        if (!qc->pub_conn) {
+            free(qc);
+            free(buf->base);
+            return;
+        }
+        qc->pub_conn->backend = LP2P_CONN_BACKEND_QUIC;
+        qc->pub_conn->backend_impl = qc;
 
         memcpy(&qc->remote_addr, addr, sockaddr_len((const struct sockaddr_storage *)addr));
 
@@ -1143,12 +1788,17 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         /* Generate SCID */
         RAND_bytes(qc->scid.data, QUIC_SCID_LEN);
         qc->scid.datalen = QUIC_SCID_LEN;
+        if (!quic_conn_track_local_cid(qc, &qc->scid)) {
+            lp2p_conn_destroy(qc->pub_conn);
+            free(buf->base);
+            return;
+        }
 
         /* Extract DCID from the incoming initial packet */
         ngtcp2_version_cid vc;
         if (ngtcp2_pkt_decode_version_cid(&vc, (const uint8_t *)buf->base,
                                            (size_t)nread, QUIC_SCID_LEN) != 0) {
-            free(qc);
+            lp2p_conn_destroy(qc->pub_conn);
             free(buf->base);
             return;
         }
@@ -1158,7 +1808,7 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         /* Create SSL context and SSL object */
         lp2p_err_t err = quic_tls_create_ssl_ctx(qt->keypair, true, &qc->ssl_ctx);
         if (err != LP2P_OK) {
-            free(qc);
+            lp2p_conn_destroy(qc->pub_conn);
             free(buf->base);
             return;
         }
@@ -1166,10 +1816,14 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         qc->ssl = SSL_new(qc->ssl_ctx);
         if (!qc->ssl) {
             SSL_CTX_free(qc->ssl_ctx);
-            free(qc);
+            qc->ssl_ctx = NULL;
+            lp2p_conn_destroy(qc->pub_conn);
             free(buf->base);
             return;
         }
+        qc->conn_ref.get_conn = quic_crypto_get_conn;
+        qc->conn_ref.user_data = qc;
+        SSL_set_app_data(qc->ssl, &qc->conn_ref);
         SSL_set_accept_state(qc->ssl);
 
         /* Set up ngtcp2 connection */
@@ -1196,7 +1850,9 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         if (rv != 0) {
             SSL_free(qc->ssl);
             SSL_CTX_free(qc->ssl_ctx);
-            free(qc);
+            qc->ssl = NULL;
+            qc->ssl_ctx = NULL;
+            lp2p_conn_destroy(qc->pub_conn);
             free(buf->base);
             return;
         }
@@ -1207,6 +1863,7 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         /* Initialize timer */
         uv_timer_init(qt->loop, &qc->timer);
         qc->timer.data = qc;
+        qc->timer_initialized = true;
 
         /* Add to transport's connection list */
         qc->next = qt->conns;
@@ -1231,9 +1888,20 @@ static void udp_recv_cb(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
         if (rv != 0 && rv != NGTCP2_ERR_DRAINING) {
             /* Connection error */
             if (!qc->is_server && qc->on_conn_cb) {
-                qc->on_conn_cb(NULL, LP2P_ERR_HANDSHAKE_FAILED, qc->on_conn_ud);
+                void (*cb)(lp2p_conn_t *, lp2p_err_t, void *) = qc->on_conn_cb;
+                void *ud = qc->on_conn_ud;
                 qc->on_conn_cb = NULL;
+                qc->state = QUIC_CONN_CLOSED;
+                cb(NULL, LP2P_ERR_HANDSHAKE_FAILED, ud);
+                if (qc->pub_conn) {
+                    lp2p_conn_destroy(qc->pub_conn);
+                }
+            } else if (qc->pub_conn && qc->pub_conn->state != CONN_STATE_READY) {
+                qc->state = QUIC_CONN_CLOSED;
+                lp2p_conn_destroy(qc->pub_conn);
             }
+            free(buf->base);
+            return;
         }
 
         /* Write any response packets */
@@ -1267,13 +1935,14 @@ static bool quic_handles(void *transport, const lp2p_multiaddr_t *addr)
  * ════════════════════════════════════════════════════════════════════════════ */
 
 static lp2p_err_t quic_listen(void *transport, const lp2p_multiaddr_t *addr,
-                               void (*on_conn)(void *transport, lp2p_conn_t *conn),
+                               void (*on_conn)(void *transport, lp2p_conn_t *conn,
+                                               void *userdata),
                                void *userdata)
 {
     quic_transport_t *qt = (quic_transport_t *)transport;
-    (void)userdata;
 
     if (qt->listening) return LP2P_ERR_BUSY;
+    if (qt->udp_initialized) return LP2P_ERR_BUSY;
 
     const char *ma_str = lp2p_multiaddr_string(addr);
     if (!ma_str) return LP2P_ERR_INVALID_MULTIADDR;
@@ -1286,15 +1955,24 @@ static lp2p_err_t quic_listen(void *transport, const lp2p_multiaddr_t *addr,
     /* Initialize UDP socket */
     int rv = uv_udp_init(qt->loop, &qt->udp_server);
     if (rv != 0) return LP2P_ERR_TRANSPORT;
+    qt->udp_initialized = true;
     qt->udp_server.data = qt;
 
     unsigned int bind_flags = is_ipv6 ? UV_UDP_IPV6ONLY : 0;
     rv = uv_udp_bind(&qt->udp_server, (const struct sockaddr *)&qt->listen_addr, bind_flags);
-    if (rv != 0) return LP2P_ERR_TRANSPORT;
+    if (rv != 0) {
+        uv_close((uv_handle_t *)&qt->udp_server, udp_close_cb);
+        qt->udp_initialized = false;
+        return LP2P_ERR_TRANSPORT;
+    }
 
     /* Start receiving UDP packets */
     rv = uv_udp_recv_start(&qt->udp_server, alloc_cb, udp_recv_cb);
-    if (rv != 0) return LP2P_ERR_TRANSPORT;
+    if (rv != 0) {
+        uv_close((uv_handle_t *)&qt->udp_server, udp_close_cb);
+        qt->udp_initialized = false;
+        return LP2P_ERR_TRANSPORT;
+    }
 
     qt->on_conn = on_conn;
     qt->on_conn_ud = userdata;
@@ -1332,6 +2010,14 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
     qc->on_conn_ud = userdata;
     memcpy(&qc->remote_addr, &remote, sizeof(remote));
 
+    qc->pub_conn = lp2p_conn_new(qt->loop, false, NULL);
+    if (!qc->pub_conn) {
+        free(qc);
+        return LP2P_ERR_NOMEM;
+    }
+    qc->pub_conn->backend = LP2P_CONN_BACKEND_QUIC;
+    qc->pub_conn->backend_impl = qc;
+
     /* Check for expected peer ID in multiaddr */
     lp2p_peer_id_t expected_pid;
     if (lp2p_multiaddr_get_peer_id(addr, &expected_pid) == LP2P_OK && expected_pid.len > 0) {
@@ -1342,15 +2028,20 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
     /* Generate SCID */
     RAND_bytes(qc->scid.data, QUIC_SCID_LEN);
     qc->scid.datalen = QUIC_SCID_LEN;
+    if (!quic_conn_track_local_cid(qc, &qc->scid)) {
+        lp2p_conn_destroy(qc->pub_conn);
+        return LP2P_ERR_NOMEM;
+    }
 
     /* Generate random DCID for initial connection */
     RAND_bytes(qc->dcid.data, QUIC_SCID_LEN);
     qc->dcid.datalen = QUIC_SCID_LEN;
 
     /* If not listening yet, init a UDP socket for the dial */
-    if (!qt->listening) {
+    if (!qt->udp_initialized) {
         int rv = uv_udp_init(qt->loop, &qt->udp_server);
-        if (rv != 0) { free(qc); return LP2P_ERR_TRANSPORT; }
+        if (rv != 0) { lp2p_conn_destroy(qc->pub_conn); return LP2P_ERR_TRANSPORT; }
+        qt->udp_initialized = true;
         qt->udp_server.data = qt;
 
         /* Bind to ephemeral port */
@@ -1369,10 +2060,10 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
         }
 
         rv = uv_udp_bind(&qt->udp_server, (const struct sockaddr *)&bind_addr, 0);
-        if (rv != 0) { free(qc); return LP2P_ERR_TRANSPORT; }
+        if (rv != 0) { lp2p_conn_destroy(qc->pub_conn); return LP2P_ERR_TRANSPORT; }
 
         rv = uv_udp_recv_start(&qt->udp_server, alloc_cb, udp_recv_cb);
-        if (rv != 0) { free(qc); return LP2P_ERR_TRANSPORT; }
+        if (rv != 0) { lp2p_conn_destroy(qc->pub_conn); return LP2P_ERR_TRANSPORT; }
     }
 
     /* Get local address */
@@ -1382,16 +2073,20 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
     /* Create SSL context and SSL object */
     lp2p_err_t err = quic_tls_create_ssl_ctx(qt->keypair, false, &qc->ssl_ctx);
     if (err != LP2P_OK) {
-        free(qc);
+        lp2p_conn_destroy(qc->pub_conn);
         return err;
     }
 
     qc->ssl = SSL_new(qc->ssl_ctx);
     if (!qc->ssl) {
         SSL_CTX_free(qc->ssl_ctx);
-        free(qc);
+        qc->ssl_ctx = NULL;
+        lp2p_conn_destroy(qc->pub_conn);
         return LP2P_ERR_CRYPTO;
     }
+    qc->conn_ref.get_conn = quic_crypto_get_conn;
+    qc->conn_ref.user_data = qc;
+    SSL_set_app_data(qc->ssl, &qc->conn_ref);
     SSL_set_connect_state(qc->ssl);
 
     /* Set up ngtcp2 client connection */
@@ -1414,7 +2109,9 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
     if (rv != 0) {
         SSL_free(qc->ssl);
         SSL_CTX_free(qc->ssl_ctx);
-        free(qc);
+        qc->ssl = NULL;
+        qc->ssl_ctx = NULL;
+        lp2p_conn_destroy(qc->pub_conn);
         return LP2P_ERR_TRANSPORT;
     }
     qc->conn = conn;
@@ -1424,6 +2121,7 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
     /* Initialize timer */
     uv_timer_init(qt->loop, &qc->timer);
     qc->timer.data = qc;
+    qc->timer_initialized = true;
 
     /* Add to transport's connection list */
     qc->next = qt->conns;
@@ -1439,12 +2137,28 @@ static lp2p_err_t quic_dial(void *transport, const lp2p_multiaddr_t *addr,
  *  Transport vtable: close
  * ════════════════════════════════════════════════════════════════════════════ */
 
-static void timer_close_cb(uv_handle_t *handle) { (void)handle; }
+static void timer_close_cb(uv_handle_t *handle)
+{
+    quic_conn_t *qc = (quic_conn_t *)handle->data;
+    if (!qc) return;
+
+    if (qc->close_handles_pending > 0) {
+        qc->close_handles_pending--;
+    }
+    if (qc->close_handles_pending == 0) {
+        free(qc);
+    }
+}
+
 static void udp_close_cb(uv_handle_t *handle) { (void)handle; }
 
 static void quic_conn_free(quic_conn_t *qc)
 {
-    if (!qc) return;
+    if (!qc || qc->cleanup_started) return;
+    qc->cleanup_started = true;
+
+    quic_transport_t *qt = qc->transport;
+    quic_conn_remove(qc);
 
     if (qc->conn) {
         ngtcp2_conn_del(qc->conn);
@@ -1465,47 +2179,118 @@ static void quic_conn_free(quic_conn_t *qc)
     quic_stream_t *qs = qc->streams;
     while (qs) {
         quic_stream_t *next = qs->next;
-        free(qs->recv_buf);
-        free(qs);
+        quic_stream_free(qs);
         qs = next;
     }
+    qc->streams = NULL;
+
+    quic_local_cid_t *cid = qc->local_cids;
+    while (cid) {
+        quic_local_cid_t *next = cid->next;
+        free(cid);
+        cid = next;
+    }
+    qc->local_cids = NULL;
 
     /* Stop and close timer */
-    uv_timer_stop(&qc->timer);
-    if (!uv_is_closing((uv_handle_t *)&qc->timer)) {
-        uv_close((uv_handle_t *)&qc->timer, timer_close_cb);
+    if (qc->timer_initialized) {
+        uv_timer_stop(&qc->timer);
+        if (!uv_is_closing((uv_handle_t *)&qc->timer)) {
+            qc->close_handles_pending++;
+            qc->timer.data = qc;
+            uv_close((uv_handle_t *)&qc->timer, timer_close_cb);
+        }
+        qc->timer_initialized = false;
     }
 
-    free(qc);
+    if (qt) {
+        quic_transport_maybe_close_udp(qt);
+    }
+
+    if (qc->close_handles_pending == 0) {
+        free(qc);
+    }
 }
 
 static void quic_close(void *transport)
 {
     quic_transport_t *qt = (quic_transport_t *)transport;
-
-    /* Close all connections */
-    quic_conn_t *qc = qt->conns;
-    while (qc) {
-        quic_conn_t *next = qc->next;
-        qc->state = QUIC_CONN_CLOSED;
-        quic_conn_free(qc);
-        qc = next;
-    }
-    qt->conns = NULL;
-
-    /* Stop UDP reception and close the socket */
-    if (qt->listening || !uv_is_closing((uv_handle_t *)&qt->udp_server)) {
-        uv_udp_recv_stop(&qt->udp_server);
-        if (!uv_is_closing((uv_handle_t *)&qt->udp_server)) {
-            uv_close((uv_handle_t *)&qt->udp_server, udp_close_cb);
-        }
-        qt->listening = false;
-    }
+    qt->listening = false;
+    qt->on_conn = NULL;
+    qt->on_conn_ud = NULL;
+    quic_transport_maybe_close_udp(qt);
 
     if (qt->server_ssl_ctx) {
         SSL_CTX_free(qt->server_ssl_ctx);
         qt->server_ssl_ctx = NULL;
     }
+}
+
+lp2p_err_t lp2p_quic_conn_close(lp2p_conn_t *conn)
+{
+    if (!conn || conn->backend != LP2P_CONN_BACKEND_QUIC || !conn->backend_impl) {
+        return LP2P_ERR_INVALID_ARG;
+    }
+
+    quic_conn_t *qc = (quic_conn_t *)conn->backend_impl;
+    if (qc->state == QUIC_CONN_CLOSED || conn->state == CONN_STATE_CLOSED) {
+        if (conn->close_cb.cb) {
+            conn->close_cb.cb(conn, conn->close_cb.userdata);
+        }
+        return LP2P_OK;
+    }
+
+    if (qc->conn) {
+        ngtcp2_path_storage ps;
+        ngtcp2_path_storage_zero(&ps);
+        ngtcp2_pkt_info pi;
+        ngtcp2_ccerr ccerr;
+
+        ngtcp2_ccerr_default(&ccerr);
+        ccerr.type = NGTCP2_CCERR_TYPE_APPLICATION;
+        ccerr.error_code = NGTCP2_NO_ERROR;
+
+        ngtcp2_ssize nwrite = ngtcp2_conn_write_connection_close(
+            qc->conn, &ps.path, &pi, qc->send_buf, sizeof(qc->send_buf), &ccerr, quic_now());
+        if (nwrite > 0) {
+            (void)quic_send_packet(qc, qc->send_buf, (size_t)nwrite);
+        }
+    }
+
+    void (*on_disconnect)(lp2p_conn_t *, lp2p_err_t, void *) = conn->on_disconnect;
+    void *disconnect_ud = conn->cb_userdata;
+    void (*close_cb)(lp2p_conn_t *, void *) = conn->close_cb.cb;
+    void *close_ud = conn->close_cb.userdata;
+
+    conn->on_disconnect = NULL;
+    conn->close_cb.cb = NULL;
+    conn->close_cb.userdata = NULL;
+    conn->closing = true;
+    conn->state = CONN_STATE_CLOSED;
+    qc->state = QUIC_CONN_CLOSED;
+
+    if (on_disconnect) {
+        on_disconnect(conn, LP2P_ERR_CONNECTION_CLOSED, disconnect_ud);
+    }
+    if (close_cb) {
+        close_cb(conn, close_ud);
+    }
+
+    return LP2P_OK;
+}
+
+void lp2p_quic_conn_cleanup(lp2p_conn_t *conn)
+{
+    if (!conn || conn->backend != LP2P_CONN_BACKEND_QUIC || !conn->backend_impl) {
+        return;
+    }
+
+    quic_conn_t *qc = (quic_conn_t *)conn->backend_impl;
+    conn->backend_impl = NULL;
+    if (qc->pub_conn == conn) {
+        qc->pub_conn = NULL;
+    }
+    quic_conn_free(qc);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -1538,7 +2323,28 @@ void lp2p_quic_transport_free(lp2p_transport_t *t)
     if (!t) return;
     if (t->impl) {
         quic_transport_t *qt = (quic_transport_t *)t->impl;
-        quic_close(qt);
+        quic_conn_t *qc = qt->conns;
+        qt->conns = NULL;
+        while (qc) {
+            quic_conn_t *next = qc->next;
+            qc->next = NULL;
+            qc->state = QUIC_CONN_CLOSED;
+            if (qc->pub_conn) {
+                lp2p_conn_destroy(qc->pub_conn);
+            } else {
+                quic_conn_free(qc);
+            }
+            qc = next;
+        }
+
+        qt->listening = false;
+        qt->on_conn = NULL;
+        qt->on_conn_ud = NULL;
+        if (qt->udp_initialized && !uv_is_closing((uv_handle_t *)&qt->udp_server)) {
+            uv_udp_recv_stop(&qt->udp_server);
+            uv_close((uv_handle_t *)&qt->udp_server, udp_close_cb);
+            qt->udp_initialized = false;
+        }
         free(qt);
     }
     free(t);

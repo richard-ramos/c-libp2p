@@ -34,6 +34,11 @@ typedef enum {
     CONN_STATE_CLOSED,
 } conn_state_t;
 
+typedef enum {
+    LP2P_CONN_BACKEND_TCP_YAMUX,
+    LP2P_CONN_BACKEND_QUIC,
+} lp2p_conn_backend_t;
+
 /* ── Pending open-stream request ──────────────────────────────────────────── */
 
 typedef struct {
@@ -64,6 +69,8 @@ typedef struct {
 
 struct lp2p_conn {
     conn_state_t             state;
+    lp2p_conn_backend_t      backend;
+    void                    *backend_impl;
 
     /* Identity */
     lp2p_peer_id_t           remote_peer;
@@ -139,6 +146,8 @@ lp2p_err_t lp2p_conn_upgrade(lp2p_conn_t *conn, lp2p_keypair_t *keypair,
                                void *userdata);
 
 void lp2p_conn_set_protocol_router(lp2p_conn_t *conn, lp2p_protocol_router_t *router);
+
+void lp2p_conn_handle_inbound_stream(lp2p_conn_t *conn, lp2p_stream_t *stream);
 
 void lp2p_conn_free(lp2p_conn_t *conn);
 

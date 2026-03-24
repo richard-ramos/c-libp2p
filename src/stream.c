@@ -12,9 +12,13 @@
 #include <string.h>
 
 #include "libp2p/stream.h"
+#include "connection_internal.h"
 #include "stream_internal.h"
 #include "mux/yamux/yamux_internal.h"
 #include "encoding/varint.h"
+#ifdef LP2P_HAVE_QUIC
+#include "transport/quic/quic_transport.h"
+#endif
 
 /* ── EOF deferred callbacks ──────────────────────────────────────────────── */
 typedef struct {
@@ -40,6 +44,12 @@ lp2p_err_t lp2p_stream_read(lp2p_stream_t *stream, size_t max_bytes,
                               lp2p_stream_read_cb cb, void *userdata)
 {
     if (!stream || !cb) return LP2P_ERR_INVALID_ARG;
+
+#ifdef LP2P_HAVE_QUIC
+    if (stream->conn && stream->conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        return lp2p_quic_stream_read(stream, max_bytes, cb, userdata);
+    }
+#endif
 
     /* The stream is actually a yamux_stream_t (pub field is first member) */
     yamux_stream_t *ys = (yamux_stream_t *)stream;
@@ -76,6 +86,12 @@ lp2p_err_t lp2p_stream_read_lp(lp2p_stream_t *stream, size_t max_frame_len,
 {
     if (!stream || !cb) return LP2P_ERR_INVALID_ARG;
 
+#ifdef LP2P_HAVE_QUIC
+    if (stream->conn && stream->conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        return lp2p_quic_stream_read_lp(stream, max_frame_len, cb, userdata);
+    }
+#endif
+
     yamux_stream_t *ys = (yamux_stream_t *)stream;
 
     if (ys->state == YAMUX_STREAM_RESET) return LP2P_ERR_STREAM_RESET;
@@ -109,6 +125,12 @@ lp2p_err_t lp2p_stream_write(lp2p_stream_t *stream, const lp2p_buf_t *buf,
                                lp2p_stream_write_cb cb, void *userdata)
 {
     if (!stream || !buf || !buf->data) return LP2P_ERR_INVALID_ARG;
+
+#ifdef LP2P_HAVE_QUIC
+    if (stream->conn && stream->conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        return lp2p_quic_stream_write(stream, buf, cb, userdata);
+    }
+#endif
 
     yamux_stream_t *ys = (yamux_stream_t *)stream;
     if (!ys->session || !ys->session->on_send) return LP2P_ERR_INTERNAL;
@@ -179,6 +201,12 @@ lp2p_err_t lp2p_stream_close(lp2p_stream_t *stream, lp2p_stream_write_cb cb,
 {
     if (!stream) return LP2P_ERR_INVALID_ARG;
 
+#ifdef LP2P_HAVE_QUIC
+    if (stream->conn && stream->conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        return lp2p_quic_stream_close(stream, cb, userdata);
+    }
+#endif
+
     yamux_stream_t *ys = (yamux_stream_t *)stream;
 
     ys->close_cb = cb;
@@ -193,6 +221,12 @@ lp2p_err_t lp2p_stream_reset(lp2p_stream_t *stream)
 {
     if (!stream) return LP2P_ERR_INVALID_ARG;
 
+#ifdef LP2P_HAVE_QUIC
+    if (stream->conn && stream->conn->backend == LP2P_CONN_BACKEND_QUIC) {
+        return lp2p_quic_stream_reset(stream);
+    }
+#endif
+
     yamux_stream_t *ys = (yamux_stream_t *)stream;
 
     const lp2p_mux_vtable_t *vt = yamux_get_vtable();
@@ -204,27 +238,23 @@ lp2p_err_t lp2p_stream_reset(lp2p_stream_t *stream)
 const char *lp2p_stream_protocol(const lp2p_stream_t *stream)
 {
     if (!stream) return NULL;
-    const yamux_stream_t *ys = (const yamux_stream_t *)stream;
-    return ys->pub.protocol_id;
+    return stream->protocol_id;
 }
 
 void lp2p_stream_set_userdata(lp2p_stream_t *stream, void *data)
 {
     if (!stream) return;
-    yamux_stream_t *ys = (yamux_stream_t *)stream;
-    ys->pub.userdata = data;
+    stream->userdata = data;
 }
 
 void *lp2p_stream_get_userdata(const lp2p_stream_t *stream)
 {
     if (!stream) return NULL;
-    const yamux_stream_t *ys = (const yamux_stream_t *)stream;
-    return ys->pub.userdata;
+    return stream->userdata;
 }
 
 lp2p_conn_t *lp2p_stream_connection(const lp2p_stream_t *stream)
 {
     if (!stream) return NULL;
-    const yamux_stream_t *ys = (const yamux_stream_t *)stream;
-    return ys->pub.conn;
+    return stream->conn;
 }

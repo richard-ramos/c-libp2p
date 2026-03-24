@@ -43,7 +43,7 @@ typedef struct lp2p_tcp_transport {
     /* Listener state */
     uv_tcp_t     server;
     bool         listening;
-    void       (*on_conn)(void *transport, lp2p_conn_t *conn);
+    void       (*on_conn)(void *transport, lp2p_conn_t *conn, void *userdata);
     void        *on_conn_ud;
 } lp2p_tcp_transport_t;
 

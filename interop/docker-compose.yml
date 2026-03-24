@@ -8,11 +8,12 @@ services:
       - libp2p-interop
     ports:
       - "4001:4001"
+      - "4001:4001/udp"
 
   c-node:
     build:
-      context: ..
-      dockerfile: interop/Dockerfile.c-libp2p
+      context: ../..
+      dockerfile: c-libp2p/interop/Dockerfile.c-libp2p
     container_name: c-libp2p-node
     depends_on:
       - go-node
