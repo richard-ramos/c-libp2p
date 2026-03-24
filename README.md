@@ -195,14 +195,23 @@ cd interop
 ./test_interop.sh
 ```
 
-This script builds the Docker images, starts the Go node from
-`interop/Dockerfile.go-libp2p`, and runs the C examples against it in the
-`c -> go` direction. It now covers four smoke cases:
+This script builds the Docker images, starts reusable Go and C containers, and
+exercises both interop directions across both transports. It now covers eight
+smoke cases:
 
-- `ping_peer` over TCP
-- `echo_client` over TCP
-- `ping_peer` over QUIC (`/udp/.../quic-v1`)
-- `echo_client` over QUIC (`/udp/.../quic-v1`)
+- `c -> go` ping over TCP
+- `c -> go` echo over TCP
+- `c -> go` ping over QUIC (`/udp/.../quic-v1`)
+- `c -> go` echo over QUIC (`/udp/.../quic-v1`)
+- `go -> c` ping over TCP
+- `go -> c` echo over TCP
+- `go -> c` ping over QUIC (`/udp/.../quic-v1`)
+- `go -> c` echo over QUIC (`/udp/.../quic-v1`)
+
+The harness now keeps the client containers alive and reuses them with
+`docker compose exec`, so once the images are built the interop checks should
+finish in seconds instead of paying a fresh container startup cost for every
+single case.
 
 The QUIC-enabled C image reuses the local dependency layout described in the
 QUIC build instructions above, so the following sibling directories must exist:

@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.go-libp2p
+    image: interop-go-node
     container_name: go-libp2p-node
     networks:
       - libp2p-interop
@@ -14,9 +15,23 @@ services:
     build:
       context: ../..
       dockerfile: c-libp2p/interop/Dockerfile.c-libp2p
+    image: interop-c-node
     container_name: c-libp2p-node
-    depends_on:
-      - go-node
+    command: ["sleep", "infinity"]
+    networks:
+      - libp2p-interop
+
+  c-server-tcp:
+    image: interop-c-node
+    container_name: c-libp2p-server-tcp
+    command: ["stdbuf", "-oL", "echo_server", "/ip4/0.0.0.0/tcp/9000"]
+    networks:
+      - libp2p-interop
+
+  c-server-quic:
+    image: interop-c-node
+    container_name: c-libp2p-server-quic
+    command: ["stdbuf", "-oL", "echo_server", "/ip4/0.0.0.0/udp/9000/quic-v1"]
     networks:
       - libp2p-interop
 

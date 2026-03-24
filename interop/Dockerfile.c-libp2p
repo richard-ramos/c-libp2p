@@ -37,6 +37,8 @@ RUN cmake -B build \
         -DOPENSSL_SSL_LIBRARY=/deps/boringssl/build/libssl.a \
         -DOPENSSL_CRYPTO_LIBRARY=/deps/boringssl/build/libcrypto.a \
         -DOPENSSL_VERSION=1.1.1 \
-    && cmake --build build --parallel "$(nproc)" --target example_ping_peer example_echo_client \
-    && install -m 0755 build/example_ping_peer /usr/local/bin/ping_peer
-RUN install -m 0755 build/example_echo_client /usr/local/bin/echo_client
+    && cmake --build build --parallel "$(nproc)" \
+        --target example_ping_peer example_echo_client example_echo_server \
+    && install -m 0755 build/example_ping_peer /usr/local/bin/ping_peer \
+    && install -m 0755 build/example_echo_client /usr/local/bin/echo_client \
+    && install -m 0755 build/example_echo_server /usr/local/bin/echo_server
