@@ -41,12 +41,15 @@
 #define QUIC_STREAM_BUF_INIT 4096
 #define QUIC_SCID_LEN        18
 #define QUIC_APP_ERR_RESET   1
+#define QUIC_WRITE_CHUNK_SIZE (16 * 1024)
 
 struct quic_write_chunk {
     struct quic_write_chunk *next;
     uint8_t                 *data;
     size_t                   len;
     size_t                   offset;
+    size_t                   acked;
+    uint64_t                 stream_offset;
     bool                     fin;
 };
 
@@ -88,6 +91,9 @@ static quic_stream_t *quic_conn_create_stream(quic_conn_t *qc, int64_t stream_id
 static void quic_stream_deliver_data(quic_stream_t *qs);
 static void quic_stream_maybe_notify(quic_stream_t *qs);
 static bool quic_stream_is_remote_initiated(const quic_conn_t *qc, int64_t stream_id);
+static int acked_stream_data_offset_cb(ngtcp2_conn *conn, int64_t stream_id,
+                                       uint64_t offset, uint64_t datalen,
+                                       void *user_data, void *stream_user_data);
 static void quic_conn_remove(quic_conn_t *qc);
 static bool sockaddr_to_quic_multiaddr(const struct sockaddr_storage *addr,
                                        const lp2p_peer_id_t *peer_id,
@@ -99,6 +105,56 @@ static ngtcp2_conn *quic_crypto_get_conn(ngtcp2_crypto_conn_ref *conn_ref);
 static bool quic_conn_track_local_cid(quic_conn_t *qc, const ngtcp2_cid *cid);
 static bool quic_conn_matches_local_cid(const quic_conn_t *qc,
                                         const uint8_t *data, size_t datalen);
+
+static void quic_write_chunk_free(quic_write_chunk_t *chunk)
+{
+    if (!chunk) return;
+    free(chunk->data);
+    free(chunk);
+}
+
+static void quic_write_chunk_list_free(quic_write_chunk_t *head)
+{
+    while (head) {
+        quic_write_chunk_t *next = head->next;
+        quic_write_chunk_free(head);
+        head = next;
+    }
+}
+
+static void quic_stream_append_send_chunk(quic_stream_t *qs, quic_write_chunk_t *chunk)
+{
+    chunk->next = NULL;
+    if (qs->send_tail) {
+        qs->send_tail->next = chunk;
+    } else {
+        qs->send_head = chunk;
+    }
+    qs->send_tail = chunk;
+}
+
+static void quic_stream_append_retained_chunk(quic_stream_t *qs, quic_write_chunk_t *chunk)
+{
+    chunk->next = NULL;
+    if (qs->retained_tail) {
+        qs->retained_tail->next = chunk;
+    } else {
+        qs->retained_head = chunk;
+    }
+    qs->retained_tail = chunk;
+}
+
+static void quic_stream_pop_retained_head(quic_stream_t *qs)
+{
+    quic_write_chunk_t *chunk = qs->retained_head;
+    if (!chunk) return;
+
+    qs->retained_head = chunk->next;
+    if (!qs->retained_head) {
+        qs->retained_tail = NULL;
+    }
+    quic_write_chunk_free(chunk);
+}
 
 static const lp2p_transport_vtable_t quic_vtable = {
     .listen  = quic_listen,
@@ -837,6 +893,80 @@ static int recv_stream_data_cb(ngtcp2_conn *conn, uint32_t flags,
     return 0;
 }
 
+static int acked_stream_data_offset_cb(ngtcp2_conn *conn, int64_t stream_id,
+                                       uint64_t offset, uint64_t datalen,
+                                       void *user_data, void *stream_user_data)
+{
+    (void)conn;
+    (void)stream_user_data;
+
+    quic_conn_t *qc = (quic_conn_t *)user_data;
+    quic_stream_t *qs = quic_conn_find_stream(qc, stream_id);
+    if (!qs) return 0;
+
+    if (offset != qs->acked_offset) {
+        return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+
+    uint64_t ack_cursor = offset;
+    uint64_t remaining = datalen;
+
+    while (remaining > 0) {
+        quic_write_chunk_t *chunk = qs->retained_head;
+        size_t sent_len = 0;
+        bool retained = true;
+
+        if (chunk) {
+            sent_len = chunk->len;
+        } else {
+            chunk = qs->send_head;
+            sent_len = chunk ? chunk->offset : 0;
+            retained = false;
+        }
+
+        if (!chunk) {
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+        if (chunk->stream_offset + chunk->acked != ack_cursor) {
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+        if (sent_len < chunk->acked) {
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+
+        size_t available = sent_len - chunk->acked;
+        if (available == 0) {
+            return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
+
+        size_t ackable = available;
+        if ((uint64_t)ackable > remaining) {
+            ackable = (size_t)remaining;
+        }
+
+        chunk->acked += ackable;
+        ack_cursor += ackable;
+        remaining -= ackable;
+
+        if (retained) {
+            while (qs->retained_head &&
+                   qs->retained_head->acked == qs->retained_head->len) {
+                quic_stream_pop_retained_head(qs);
+            }
+        }
+    }
+
+    qs->acked_offset = ack_cursor;
+
+    while (qs->retained_head &&
+           qs->retained_head->len == 0 &&
+           qs->retained_head->stream_offset == qs->acked_offset) {
+        quic_stream_pop_retained_head(qs);
+    }
+
+    return 0;
+}
+
 static int stream_open_cb(ngtcp2_conn *conn, int64_t stream_id, void *user_data)
 {
     (void)conn;
@@ -960,6 +1090,7 @@ static ngtcp2_callbacks make_client_callbacks(void)
 
     /* Application callbacks */
     cb.recv_stream_data        = recv_stream_data_cb;
+    cb.acked_stream_data_offset = acked_stream_data_offset_cb;
     cb.stream_open             = stream_open_cb;
     cb.stream_close            = stream_close_cb;
     cb.rand                    = rand_cb;
@@ -986,6 +1117,7 @@ static ngtcp2_callbacks make_server_callbacks(void)
     cb.version_negotiation      = ngtcp2_crypto_version_negotiation_cb;
 
     cb.recv_stream_data        = recv_stream_data_cb;
+    cb.acked_stream_data_offset = acked_stream_data_offset_cb;
     cb.stream_open             = stream_open_cb;
     cb.stream_close            = stream_close_cb;
     cb.rand                    = rand_cb;
@@ -1128,21 +1260,8 @@ static void quic_stream_free(quic_stream_t *qs)
     free(qs->pub.protocol_id);
     lp2p_buffer_free(&qs->recv_buf);
 
-    quic_write_chunk_t *chunk = qs->send_head;
-    while (chunk) {
-        quic_write_chunk_t *next = chunk->next;
-        free(chunk->data);
-        free(chunk);
-        chunk = next;
-    }
-
-    chunk = qs->retained_head;
-    while (chunk) {
-        quic_write_chunk_t *next = chunk->next;
-        free(chunk->data);
-        free(chunk);
-        chunk = next;
-    }
+    quic_write_chunk_list_free(qs->send_head);
+    quic_write_chunk_list_free(qs->retained_head);
 
     free(qs);
 }
@@ -1446,10 +1565,13 @@ static void quic_conn_write_packets(quic_conn_t *qc)
                 if (!send_stream->send_head) {
                     send_stream->send_tail = NULL;
                 }
-                chunk->next = send_stream->retained_head;
-                send_stream->retained_head = chunk;
-                if (chunk->fin) {
-                    send_stream->fin_sent = true;
+                if (chunk->acked == chunk->len) {
+                    quic_write_chunk_free(chunk);
+                } else {
+                    quic_stream_append_retained_chunk(send_stream, chunk);
+                    if (chunk->fin) {
+                        send_stream->fin_sent = true;
+                    }
                 }
             }
         }
@@ -1576,23 +1698,54 @@ lp2p_err_t lp2p_quic_stream_write(lp2p_stream_t *stream, const lp2p_buf_t *buf,
         return LP2P_ERR_CONNECTION_CLOSED;
     }
 
-    quic_write_chunk_t *chunk = calloc(1, sizeof(*chunk));
-    if (!chunk) return LP2P_ERR_NOMEM;
+    quic_write_chunk_t *new_head = NULL;
+    quic_write_chunk_t *new_tail = NULL;
+    uint64_t next_offset = qs->next_send_offset;
+    size_t pos = 0;
 
-    chunk->data = malloc(buf->len);
-    if (!chunk->data) {
-        free(chunk);
-        return LP2P_ERR_NOMEM;
+    while (pos < buf->len) {
+        size_t chunk_len = buf->len - pos;
+        if (chunk_len > QUIC_WRITE_CHUNK_SIZE) {
+            chunk_len = QUIC_WRITE_CHUNK_SIZE;
+        }
+
+        quic_write_chunk_t *chunk = calloc(1, sizeof(*chunk));
+        if (!chunk) {
+            quic_write_chunk_list_free(new_head);
+            return LP2P_ERR_NOMEM;
+        }
+
+        chunk->data = malloc(chunk_len);
+        if (!chunk->data) {
+            quic_write_chunk_free(chunk);
+            quic_write_chunk_list_free(new_head);
+            return LP2P_ERR_NOMEM;
+        }
+
+        memcpy(chunk->data, buf->data + pos, chunk_len);
+        chunk->len = chunk_len;
+        chunk->stream_offset = next_offset;
+
+        if (new_tail) {
+            new_tail->next = chunk;
+        } else {
+            new_head = chunk;
+        }
+        new_tail = chunk;
+
+        next_offset += chunk_len;
+        pos += chunk_len;
     }
-    memcpy(chunk->data, buf->data, buf->len);
-    chunk->len = buf->len;
+
+    if (!new_head) return LP2P_ERR_INVALID_ARG;
 
     if (qs->send_tail) {
-        qs->send_tail->next = chunk;
+        qs->send_tail->next = new_head;
     } else {
-        qs->send_head = chunk;
+        qs->send_head = new_head;
     }
-    qs->send_tail = chunk;
+    qs->send_tail = new_tail;
+    qs->next_send_offset = next_offset;
 
     quic_conn_write_packets(qc);
     if (cb) cb(stream, LP2P_OK, userdata);
@@ -1617,14 +1770,10 @@ lp2p_err_t lp2p_quic_stream_close(lp2p_stream_t *stream, lp2p_stream_write_cb cb
     quic_write_chunk_t *chunk = calloc(1, sizeof(*chunk));
     if (!chunk) return LP2P_ERR_NOMEM;
     chunk->fin = true;
+    chunk->stream_offset = qs->next_send_offset;
     qs->fin_sent = true;
 
-    if (qs->send_tail) {
-        qs->send_tail->next = chunk;
-    } else {
-        qs->send_head = chunk;
-    }
-    qs->send_tail = chunk;
+    quic_stream_append_send_chunk(qs, chunk);
 
     quic_conn_write_packets(qc);
     if (cb) cb(stream, LP2P_OK, userdata);

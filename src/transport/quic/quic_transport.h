@@ -50,6 +50,11 @@ struct quic_stream {
     quic_write_chunk_t *send_head;
     quic_write_chunk_t *send_tail;
     quic_write_chunk_t *retained_head;
+    quic_write_chunk_t *retained_tail;
+
+    /* Absolute stream offsets for send-buffer lifetime tracking */
+    uint64_t          next_send_offset;
+    uint64_t          acked_offset;
 
     /* Stream state */
     bool             inbound_notified;

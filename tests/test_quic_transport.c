@@ -43,6 +43,7 @@ static int tests_failed = 0;
 
 #define TEST_PROTO "/test/quic/1.0.0"
 #define TEST_MESSAGE "hello quic transport"
+#define LARGE_TEST_MESSAGE_LEN (128 * 1024)
 
 typedef struct {
     lp2p_keypair_t *server_kp;
@@ -63,6 +64,10 @@ typedef struct {
     bool client_received;
     char server_msg[128];
     char client_msg[128];
+    uint8_t *large_msg;
+    size_t large_msg_len;
+    bool server_large_received;
+    bool client_large_received;
     uv_timer_t stop_timer;
     uv_timer_t safety_timer;
     bool stop_timer_init;
@@ -85,6 +90,7 @@ static void quic_fixture_cleanup(uv_loop_t *loop, quic_fixture_t *fx)
     if (fx->server_router) lp2p_protocol_router_free(fx->server_router);
     if (fx->server_kp) lp2p_keypair_free(fx->server_kp);
     if (fx->client_kp) lp2p_keypair_free(fx->client_kp);
+    free(fx->large_msg);
 
     if (fx->safety_timer_init) {
         uv_timer_stop(&fx->safety_timer);
@@ -169,6 +175,13 @@ static lp2p_err_t make_quic_dial_addr(const lp2p_keypair_t *server_kp,
              "/ip4/127.0.0.1/udp/%d/quic-v1/p2p/%s",
              port, peer_str);
     return lp2p_multiaddr_parse(dial_str, out);
+}
+
+static void fill_large_test_message(uint8_t *buf, size_t len)
+{
+    for (size_t i = 0; i < len; ++i) {
+        buf[i] = (uint8_t)(((i * 31u) + 7u) & 0xffu);
+    }
 }
 
 static void on_listener_conn(lp2p_listener_t *listener, lp2p_conn_t *conn, void *userdata)
@@ -316,6 +329,121 @@ static void on_dial_conn_rw(lp2p_conn_t *conn, lp2p_err_t err, void *userdata)
 
     lp2p_err_t serr = lp2p_conn_open_stream(conn, TEST_PROTO,
                                             client_echo_on_stream, fx);
+    if (serr != LP2P_OK) {
+        fx->client_err = serr;
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+    }
+}
+
+static void server_large_echo_on_read(lp2p_stream_t *stream, lp2p_err_t err,
+                                      const lp2p_buf_t *buf, void *userdata)
+{
+    quic_fixture_t *fx = (quic_fixture_t *)userdata;
+
+    if (err != LP2P_OK || !buf || buf->len != fx->large_msg_len ||
+        memcmp(buf->data, fx->large_msg, fx->large_msg_len) != 0) {
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+        return;
+    }
+
+    fx->server_large_received = true;
+
+    lp2p_buf_t reply = {
+        .data = buf->data,
+        .len = buf->len,
+    };
+    lp2p_err_t werr = lp2p_stream_write_lp(stream, &reply, server_echo_write_done, fx);
+    if (werr != LP2P_OK) {
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+    }
+}
+
+static void server_large_echo_handler(lp2p_stream_t *stream, void *userdata)
+{
+    quic_fixture_t *fx = (quic_fixture_t *)userdata;
+    lp2p_err_t err = lp2p_stream_read_lp(stream, fx->large_msg_len,
+                                         server_large_echo_on_read, fx);
+    if (err != LP2P_OK) {
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+    }
+}
+
+static void client_large_echo_on_read(lp2p_stream_t *stream, lp2p_err_t err,
+                                      const lp2p_buf_t *buf, void *userdata)
+{
+    quic_fixture_t *fx = (quic_fixture_t *)userdata;
+
+    if (err != LP2P_OK || !buf || buf->len != fx->large_msg_len ||
+        memcmp(buf->data, fx->large_msg, fx->large_msg_len) != 0) {
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+        return;
+    }
+
+    fx->client_large_received = true;
+
+    lp2p_stream_close(stream, NULL, NULL);
+    uv_timer_start(&fx->stop_timer, stop_loop_cb, 100, 0);
+}
+
+static void client_large_echo_on_write(lp2p_stream_t *stream, lp2p_err_t err, void *userdata)
+{
+    quic_fixture_t *fx = (quic_fixture_t *)userdata;
+
+    if (err != LP2P_OK) {
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+        return;
+    }
+
+    lp2p_err_t rerr = lp2p_stream_read_lp(stream, fx->large_msg_len,
+                                          client_large_echo_on_read, fx);
+    if (rerr != LP2P_OK) {
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+    }
+}
+
+static void client_large_echo_on_stream(lp2p_stream_t *stream, lp2p_err_t err, void *userdata)
+{
+    quic_fixture_t *fx = (quic_fixture_t *)userdata;
+
+    if (err != LP2P_OK || !stream) {
+        fx->client_err = err;
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+        return;
+    }
+
+    lp2p_buf_t msg = {
+        .data = fx->large_msg,
+        .len = fx->large_msg_len,
+    };
+    lp2p_err_t werr = lp2p_stream_write_lp(stream, &msg, client_large_echo_on_write, fx);
+    if (werr != LP2P_OK) {
+        fx->client_err = werr;
+        lp2p_stream_reset(stream);
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+    }
+}
+
+static void on_dial_conn_rw_large(lp2p_conn_t *conn, lp2p_err_t err, void *userdata)
+{
+    quic_fixture_t *fx = (quic_fixture_t *)userdata;
+
+    fx->client_connected = (err == LP2P_OK);
+    fx->client_err = err;
+    fx->client_conn = conn;
+
+    if (err != LP2P_OK || !conn) {
+        uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
+        return;
+    }
+
+    lp2p_err_t serr = lp2p_conn_open_stream(conn, TEST_PROTO,
+                                            client_large_echo_on_stream, fx);
     if (serr != LP2P_OK) {
         fx->client_err = serr;
         uv_timer_start(&fx->stop_timer, stop_loop_cb, 0, 0);
@@ -485,6 +613,59 @@ cleanup:
     quic_fixture_cleanup(&loop, &fx);
 }
 
+static void test_stream_large_read_write(void)
+{
+    uv_loop_t loop;
+    uv_loop_init(&loop);
+
+    quic_fixture_t fx = {0};
+    lp2p_err_t err = quic_fixture_init(&loop, &fx);
+    TEST_ASSERT(err == LP2P_OK, "quic_fixture_init should succeed");
+
+    fx.large_msg_len = LARGE_TEST_MESSAGE_LEN;
+    fx.large_msg = malloc(fx.large_msg_len);
+    TEST_ASSERT(fx.large_msg != NULL, "large test message should allocate");
+    fill_large_test_message(fx.large_msg, fx.large_msg_len);
+
+    fx.server_router = lp2p_protocol_router_new(&loop);
+    TEST_ASSERT(fx.server_router != NULL, "server router should allocate");
+
+    err = lp2p_protocol_router_add(fx.server_router, TEST_PROTO, server_large_echo_handler, &fx);
+    TEST_ASSERT(err == LP2P_OK, "server router should register protocol");
+
+    err = lp2p_multiaddr_parse("/ip4/127.0.0.1/udp/0/quic-v1", &fx.listen_addr);
+    TEST_ASSERT(err == LP2P_OK, "listen multiaddr should parse");
+
+    err = lp2p_listener_new(&loop, fx.server_transport, fx.listen_addr, &fx.listener);
+    TEST_ASSERT(err == LP2P_OK, "listener_new should succeed");
+
+    err = lp2p_listener_start(fx.listener, on_listener_conn, &fx);
+    TEST_ASSERT(err == LP2P_OK, "listener_start should succeed");
+
+    int port = quic_bound_port(fx.server_transport);
+    TEST_ASSERT(port > 0, "server UDP port should be discoverable");
+
+    err = make_quic_dial_addr(fx.server_kp, port, &fx.dial_addr);
+    TEST_ASSERT(err == LP2P_OK, "dial multiaddr should build");
+
+    err = lp2p_dialer_new(&loop, fx.client_transport, 5000, &fx.dialer);
+    TEST_ASSERT(err == LP2P_OK, "dialer_new should succeed");
+
+    err = lp2p_dialer_dial(fx.dialer, fx.dial_addr, on_dial_conn_rw_large, &fx);
+    TEST_ASSERT(err == LP2P_OK, "dial should initiate successfully");
+
+    uv_timer_start(&fx.safety_timer, stop_loop_cb, 10000, 0);
+    uv_run(&loop, UV_RUN_DEFAULT);
+
+    TEST_ASSERT(fx.client_connected, "client should have connected");
+    TEST_ASSERT(fx.server_got_conn, "server should have received connection");
+    TEST_ASSERT(fx.server_large_received, "server should have received large payload");
+    TEST_ASSERT(fx.client_large_received, "client should have received large echoed payload");
+
+cleanup:
+    quic_fixture_cleanup(&loop, &fx);
+}
+
 int main(void)
 {
     printf("test_quic_transport:\n");
@@ -493,6 +674,7 @@ int main(void)
     TEST_RUN(test_transport_handles);
     TEST_RUN(test_listen_dial_loopback);
     TEST_RUN(test_stream_read_write);
+    TEST_RUN(test_stream_large_read_write);
 
     printf("\n  Results: %d passed, %d failed\n", tests_passed, tests_failed);
     return tests_failed > 0 ? 1 : 0;
