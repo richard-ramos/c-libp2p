@@ -53,6 +53,19 @@ struct quic_write_chunk {
     bool                     fin;
 };
 
+typedef enum {
+    QUIC_STREAM_ACTION_CLOSE,
+    QUIC_STREAM_ACTION_RESET,
+} quic_stream_action_t;
+
+typedef struct {
+    lp2p_conn_t          *conn;
+    int64_t               stream_id;
+    quic_stream_action_t  action;
+    lp2p_stream_write_cb  close_cb;
+    void                 *close_ud;
+} quic_stream_deferred_action_t;
+
 /* quic_now() was removed in newer ngtcp2 versions; use CLOCK_MONOTONIC */
 static ngtcp2_tstamp quic_now(void) {
     struct timespec ts;
@@ -105,6 +118,15 @@ static ngtcp2_conn *quic_crypto_get_conn(ngtcp2_crypto_conn_ref *conn_ref);
 static bool quic_conn_track_local_cid(quic_conn_t *qc, const ngtcp2_cid *cid);
 static bool quic_conn_matches_local_cid(const quic_conn_t *qc,
                                         const uint8_t *data, size_t datalen);
+static lp2p_err_t quic_stream_close_now(lp2p_stream_t *stream, lp2p_stream_write_cb cb,
+                                        void *userdata);
+static lp2p_err_t quic_stream_reset_now(lp2p_stream_t *stream);
+static void quic_stream_deferred_action_run(void *arg);
+static void quic_stream_deferred_action_cleanup(void *arg);
+static lp2p_err_t quic_stream_schedule_action(lp2p_stream_t *stream,
+                                              quic_stream_action_t action,
+                                              lp2p_stream_write_cb cb,
+                                              void *userdata);
 
 static void quic_write_chunk_free(quic_write_chunk_t *chunk)
 {
@@ -120,6 +142,60 @@ static void quic_write_chunk_list_free(quic_write_chunk_t *head)
         quic_write_chunk_free(head);
         head = next;
     }
+}
+
+static void quic_stream_deferred_action_cleanup(void *arg)
+{
+    free(arg);
+}
+
+static void quic_stream_deferred_action_run(void *arg)
+{
+    quic_stream_deferred_action_t *action = arg;
+    lp2p_conn_t *conn = action->conn;
+
+    if (conn && conn->backend == LP2P_CONN_BACKEND_QUIC && conn->backend_impl) {
+        quic_conn_t *qc = (quic_conn_t *)conn->backend_impl;
+        quic_stream_t *qs = quic_conn_find_stream(qc, action->stream_id);
+
+        if (qs) {
+            if (action->action == QUIC_STREAM_ACTION_CLOSE) {
+                (void)quic_stream_close_now(&qs->pub, action->close_cb, action->close_ud);
+            } else {
+                (void)quic_stream_reset_now(&qs->pub);
+            }
+        }
+    }
+
+    free(action);
+}
+
+static lp2p_err_t quic_stream_schedule_action(lp2p_stream_t *stream,
+                                              quic_stream_action_t action,
+                                              lp2p_stream_write_cb cb,
+                                              void *userdata)
+{
+    if (!stream) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_t *qs = (quic_stream_t *)stream;
+    quic_conn_t *qc = qs->qconn;
+    if (!qc || !qc->pub_conn) return LP2P_ERR_INVALID_ARG;
+
+    quic_stream_deferred_action_t *deferred = calloc(1, sizeof(*deferred));
+    if (!deferred) return LP2P_ERR_NOMEM;
+
+    deferred->conn = qc->pub_conn;
+    deferred->stream_id = qs->stream_id;
+    deferred->action = action;
+    deferred->close_cb = cb;
+    deferred->close_ud = userdata;
+
+    if (!lp2p_conn_defer(qc->pub_conn, quic_stream_deferred_action_run,
+                         deferred, quic_stream_deferred_action_cleanup)) {
+        return LP2P_ERR_NOMEM;
+    }
+
+    return LP2P_OK;
 }
 
 static void quic_stream_append_send_chunk(quic_stream_t *qs, quic_write_chunk_t *chunk)
@@ -1752,8 +1828,8 @@ lp2p_err_t lp2p_quic_stream_write(lp2p_stream_t *stream, const lp2p_buf_t *buf,
     return LP2P_OK;
 }
 
-lp2p_err_t lp2p_quic_stream_close(lp2p_stream_t *stream, lp2p_stream_write_cb cb,
-                                   void *userdata)
+static lp2p_err_t quic_stream_close_now(lp2p_stream_t *stream, lp2p_stream_write_cb cb,
+                                        void *userdata)
 {
     if (!stream) return LP2P_ERR_INVALID_ARG;
 
@@ -1780,7 +1856,7 @@ lp2p_err_t lp2p_quic_stream_close(lp2p_stream_t *stream, lp2p_stream_write_cb cb
     return LP2P_OK;
 }
 
-lp2p_err_t lp2p_quic_stream_reset(lp2p_stream_t *stream)
+static lp2p_err_t quic_stream_reset_now(lp2p_stream_t *stream)
 {
     if (!stream) return LP2P_ERR_INVALID_ARG;
 
@@ -1795,6 +1871,17 @@ lp2p_err_t lp2p_quic_stream_reset(lp2p_stream_t *stream)
     quic_conn_write_packets(qc);
     quic_stream_deliver_data(qs);
     return LP2P_OK;
+}
+
+lp2p_err_t lp2p_quic_stream_close(lp2p_stream_t *stream, lp2p_stream_write_cb cb,
+                                   void *userdata)
+{
+    return quic_stream_schedule_action(stream, QUIC_STREAM_ACTION_CLOSE, cb, userdata);
+}
+
+lp2p_err_t lp2p_quic_stream_reset(lp2p_stream_t *stream)
+{
+    return quic_stream_schedule_action(stream, QUIC_STREAM_ACTION_RESET, NULL, NULL);
 }
 
 /* ════════════════════════════════════════════════════════════════════════════

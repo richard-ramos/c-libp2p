@@ -25,7 +25,19 @@ if(LP2P_ENABLE_QUIC)
 endif()
 
 # ── Generate protobuf-c sources ────────────────────────────────────────────────
-find_program(PROTOC_C protoc-c REQUIRED)
+find_program(PROTOC_EXECUTABLE NAMES protoc)
+find_program(PROTOC_GEN_C NAMES protoc-gen-c)
+find_program(PROTOC_C NAMES protoc-c)
+
+if(PROTOC_EXECUTABLE AND PROTOC_GEN_C)
+    set(PROTOC_C_COMMAND "${PROTOC_EXECUTABLE}")
+    set(PROTOC_C_PLUGIN_ARGS "--plugin=protoc-gen-c=${PROTOC_GEN_C}")
+elseif(PROTOC_C)
+    set(PROTOC_C_COMMAND "${PROTOC_C}")
+    set(PROTOC_C_PLUGIN_ARGS)
+else()
+    message(FATAL_ERROR "Could not find protoc-c or protoc with protoc-gen-c")
+endif()
 
 set(PROTO_DIR  "${CMAKE_SOURCE_DIR}/proto")
 set(PROTO_OUT  "${CMAKE_BINARY_DIR}/proto-gen")
@@ -33,13 +45,21 @@ file(MAKE_DIRECTORY "${PROTO_OUT}")
 
 add_custom_command(
     OUTPUT "${PROTO_OUT}/noise.pb-c.c" "${PROTO_OUT}/noise.pb-c.h"
-    COMMAND ${PROTOC_C} --c_out=${PROTO_OUT} --proto_path=${PROTO_DIR} noise.proto
+    COMMAND ${PROTOC_C_COMMAND}
+            ${PROTOC_C_PLUGIN_ARGS}
+            --c_out=${PROTO_OUT}
+            --proto_path=${PROTO_DIR}
+            noise.proto
     DEPENDS "${PROTO_DIR}/noise.proto"
     COMMENT "Generating noise.pb-c.[ch]"
 )
 add_custom_command(
     OUTPUT "${PROTO_OUT}/identify.pb-c.c" "${PROTO_OUT}/identify.pb-c.h"
-    COMMAND ${PROTOC_C} --c_out=${PROTO_OUT} --proto_path=${PROTO_DIR} identify.proto
+    COMMAND ${PROTOC_C_COMMAND}
+            ${PROTOC_C_PLUGIN_ARGS}
+            --c_out=${PROTO_OUT}
+            --proto_path=${PROTO_DIR}
+            identify.proto
     DEPENDS "${PROTO_DIR}/identify.proto"
     COMMENT "Generating identify.pb-c.[ch]"
 )
@@ -95,6 +115,9 @@ add_dependencies(lp2p proto_gen)
 
 target_include_directories(lp2p
     PUBLIC  "${CMAKE_SOURCE_DIR}/include"
+            ${LIBUV_INCLUDE_DIRS}
+            ${LIBSODIUM_INCLUDE_DIRS}
+            ${PROTOBUFC_INCLUDE_DIRS}
     PRIVATE "${CMAKE_SOURCE_DIR}/src"
             "${PROTO_OUT}"
 )
@@ -106,6 +129,9 @@ target_link_libraries(lp2p
         OpenSSL::Crypto
         ${PROTOBUFC_LIBRARIES}
 )
+if(WIN32)
+    target_link_libraries(lp2p PUBLIC ws2_32)
+endif()
 if(LP2P_ENABLE_QUIC)
     target_include_directories(lp2p PRIVATE ${NGTCP2_INCLUDE_DIRS})
     target_link_libraries(lp2p PUBLIC ${NGTCP2_LIBRARIES} stdc++)

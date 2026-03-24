@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-#include <arpa/inet.h>
 
 #include "mux/yamux/yamux_internal.h"
 #include "encoding/varint.h"
@@ -20,10 +19,14 @@ void yamux_header_encode(const yamux_header_t *h, uint8_t buf[YAMUX_HEADER_SIZE]
     buf[1] = h->type;
     buf[2] = (uint8_t)(h->flags >> 8);
     buf[3] = (uint8_t)(h->flags & 0xFF);
-    uint32_t sid = htonl(h->stream_id);
-    memcpy(&buf[4], &sid, 4);
-    uint32_t len = htonl(h->length);
-    memcpy(&buf[8], &len, 4);
+    buf[4] = (uint8_t)(h->stream_id >> 24);
+    buf[5] = (uint8_t)(h->stream_id >> 16);
+    buf[6] = (uint8_t)(h->stream_id >> 8);
+    buf[7] = (uint8_t)(h->stream_id & 0xFF);
+    buf[8] = (uint8_t)(h->length >> 24);
+    buf[9] = (uint8_t)(h->length >> 16);
+    buf[10] = (uint8_t)(h->length >> 8);
+    buf[11] = (uint8_t)(h->length & 0xFF);
 }
 
 bool yamux_header_decode(const uint8_t buf[YAMUX_HEADER_SIZE], yamux_header_t *h)
@@ -31,11 +34,14 @@ bool yamux_header_decode(const uint8_t buf[YAMUX_HEADER_SIZE], yamux_header_t *h
     h->version = buf[0];
     h->type    = buf[1];
     h->flags   = ((uint16_t)buf[2] << 8) | buf[3];
-    uint32_t sid, len;
-    memcpy(&sid, &buf[4], 4);
-    memcpy(&len, &buf[8], 4);
-    h->stream_id = ntohl(sid);
-    h->length    = ntohl(len);
+    h->stream_id = ((uint32_t)buf[4] << 24) |
+                   ((uint32_t)buf[5] << 16) |
+                   ((uint32_t)buf[6] << 8) |
+                   (uint32_t)buf[7];
+    h->length = ((uint32_t)buf[8] << 24) |
+                ((uint32_t)buf[9] << 16) |
+                ((uint32_t)buf[10] << 8) |
+                (uint32_t)buf[11];
     return (h->version == YAMUX_VERSION);
 }
 

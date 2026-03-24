@@ -51,11 +51,13 @@ typedef struct {
 /* ── Deferred callback ────────────────────────────────────────────────────── */
 
 typedef void (*conn_deferred_fn)(void *arg);
+typedef void (*conn_deferred_cleanup_fn)(void *arg);
 
 typedef struct {
     lp2p_list_node_t node;
     conn_deferred_fn fn;
     void            *arg;
+    conn_deferred_cleanup_fn cleanup;
 } conn_deferred_t;
 
 /* ── Close callback info ──────────────────────────────────────────────────── */
@@ -148,6 +150,9 @@ lp2p_err_t lp2p_conn_upgrade(lp2p_conn_t *conn, lp2p_keypair_t *keypair,
 void lp2p_conn_set_protocol_router(lp2p_conn_t *conn, lp2p_protocol_router_t *router);
 
 void lp2p_conn_handle_inbound_stream(lp2p_conn_t *conn, lp2p_stream_t *stream);
+
+bool lp2p_conn_defer(lp2p_conn_t *conn, conn_deferred_fn fn, void *arg,
+                     conn_deferred_cleanup_fn cleanup);
 
 void lp2p_conn_free(lp2p_conn_t *conn);
 

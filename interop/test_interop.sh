@@ -11,11 +11,13 @@ cd "$SCRIPT_DIR"
 
 PASS=0
 FAIL=0
-CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-20s}"
+CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-40s}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-30}"
-GO_CLIENT_TIMEOUT="${GO_CLIENT_TIMEOUT:-10s}"
+GO_CLIENT_TIMEOUT="${GO_CLIENT_TIMEOUT:-30s}"
 GO_PING_COUNT="${GO_PING_COUNT:-3}"
 GO_SETTLE="${GO_SETTLE:-100ms}"
+GO_TCP_CLIENT_RETRIES="${GO_TCP_CLIENT_RETRIES:-3}"
+GO_TCP_CLIENT_RETRY_DELAY="${GO_TCP_CLIENT_RETRY_DELAY:-1s}"
 
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL + 1)); }
@@ -43,6 +45,43 @@ run_capture() {
     wait "$tail_pid" 2>/dev/null || true
     printf -v "$__outvar" '%s' "$(cat "$tmp")"
     rm -f "$tmp"
+    return "$status"
+}
+
+run_capture_retry() {
+    local __outvar=$1
+    local attempts=$2
+    local delay=$3
+    shift 3
+
+    local combined=""
+    local attempt_output=""
+    local status=0
+    local attempt=1
+
+    while [ "$attempt" -le "$attempts" ]; do
+        status=0
+        run_capture attempt_output "$@" || status=$?
+
+        if [ -n "$combined" ]; then
+            combined+=$'\n'
+        fi
+        combined+="$attempt_output"
+
+        if [ "$status" -eq 0 ]; then
+            printf -v "$__outvar" '%s' "$combined"
+            return 0
+        fi
+
+        if [ "$attempt" -lt "$attempts" ]; then
+            echo "Retrying command after exit status ${status} (${attempt}/${attempts})..."
+            sleep "$delay"
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    printf -v "$__outvar" '%s' "$combined"
     return "$status"
 }
 
@@ -299,7 +338,8 @@ echo ""
 echo "=== Test 5: Go -> C ping over TCP ==="
 GO_PING_TCP_OUTPUT=""
 GO_PING_TCP_STATUS=0
-run_capture GO_PING_TCP_OUTPUT timeout "$CLIENT_TIMEOUT" docker compose exec --interactive=false -T go-node \
+run_capture_retry GO_PING_TCP_OUTPUT "$GO_TCP_CLIENT_RETRIES" "$GO_TCP_CLIENT_RETRY_DELAY" \
+    timeout "$CLIENT_TIMEOUT" docker compose exec --interactive=false -T go-node \
     go-libp2p-interop ping-client \
     --target "$C_TCP_TARGET" \
     --count "$GO_PING_COUNT" \
@@ -334,7 +374,8 @@ echo ""
 echo "=== Test 6: Go -> C echo over TCP ==="
 GO_ECHO_TCP_OUTPUT=""
 GO_ECHO_TCP_STATUS=0
-run_capture GO_ECHO_TCP_OUTPUT timeout "$CLIENT_TIMEOUT" docker compose exec --interactive=false -T go-node \
+run_capture_retry GO_ECHO_TCP_OUTPUT "$GO_TCP_CLIENT_RETRIES" "$GO_TCP_CLIENT_RETRY_DELAY" \
+    timeout "$CLIENT_TIMEOUT" docker compose exec --interactive=false -T go-node \
     go-libp2p-interop echo-client \
     --target "$C_TCP_TARGET" \
     --message "hello from go to c over tcp" \

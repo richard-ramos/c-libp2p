@@ -12,12 +12,20 @@
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
+static char *dup_n(const char *src, size_t len) {
+    char *dst = malloc(len + 1);
+    if (!dst) return NULL;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
 static char *peer_id_key(const lp2p_peer_id_t *pid) {
     char buf[128];
     size_t len = sizeof(buf);
     if (lp2p_peer_id_to_string(pid, buf, &len) != LP2P_OK)
         return NULL;
-    return strndup(buf, len);
+    return dup_n(buf, len);
 }
 
 static bool conn_has_peer_id(const lp2p_conn_t *conn) {

@@ -9,7 +9,7 @@
 #include "encoding/multibase.h"
 #include "encoding/multihash.h"
 #include "util/buffer.h"
-#include <arpa/inet.h>
+#include <uv.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -20,6 +20,11 @@ struct lp2p_multiaddr {
     uint8_t *bytes;     /* binary encoding */
     size_t   bytes_len;
     char    *str;       /* cached string form */
+};
+
+enum {
+    LP2P_IP4_STRLEN = 16,
+    LP2P_IP6_STRLEN = 46,
 };
 
 /* ── Protocol table ──────────────────────────────────────────────────────── */
@@ -84,7 +89,7 @@ static lp2p_err_t encode_component(const proto_info_t *proto, const char *val,
     switch (proto->type) {
     case ADDR_IP4: {
         uint8_t addr[4];
-        if (inet_pton(AF_INET, val, addr) != 1)
+        if (uv_inet_pton(AF_INET, val, addr) != 0)
             return LP2P_ERR_INVALID_MULTIADDR;
         if (!lp2p_buffer_append(buf, addr, 4))
             return LP2P_ERR_NOMEM;
@@ -92,7 +97,7 @@ static lp2p_err_t encode_component(const proto_info_t *proto, const char *val,
     }
     case ADDR_IP6: {
         uint8_t addr[16];
-        if (inet_pton(AF_INET6, val, addr) != 1)
+        if (uv_inet_pton(AF_INET6, val, addr) != 0)
             return LP2P_ERR_INVALID_MULTIADDR;
         if (!lp2p_buffer_append(buf, addr, 16))
             return LP2P_ERR_NOMEM;
@@ -303,8 +308,9 @@ static char *bytes_to_string(const uint8_t *bytes, size_t bytes_len) {
         switch (proto->type) {
         case ADDR_IP4: {
             if (pos + 4 > bytes_len) goto fail;
-            char ip[INET_ADDRSTRLEN];
-            inet_ntop(AF_INET, bytes + pos, ip, sizeof(ip));
+            char ip[LP2P_IP4_STRLEN];
+            if (uv_inet_ntop(AF_INET, bytes + pos, ip, sizeof(ip)) != 0)
+                goto fail;
             pos += 4;
             lp2p_buffer_append_byte(&out, '/');
             lp2p_buffer_append(&out, (const uint8_t *)ip, strlen(ip));
@@ -312,8 +318,9 @@ static char *bytes_to_string(const uint8_t *bytes, size_t bytes_len) {
         }
         case ADDR_IP6: {
             if (pos + 16 > bytes_len) goto fail;
-            char ip[INET6_ADDRSTRLEN];
-            inet_ntop(AF_INET6, bytes + pos, ip, sizeof(ip));
+            char ip[LP2P_IP6_STRLEN];
+            if (uv_inet_ntop(AF_INET6, bytes + pos, ip, sizeof(ip)) != 0)
+                goto fail;
             pos += 16;
             lp2p_buffer_append_byte(&out, '/');
             lp2p_buffer_append(&out, (const uint8_t *)ip, strlen(ip));

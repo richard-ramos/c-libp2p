@@ -14,14 +14,25 @@ concurrency:
 
 jobs:
   test:
-    name: Build and Test
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-
-    defaults:
-      run:
-        shell: bash
-        working-directory: c-libp2p
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runs_on }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runs_on: ubuntu-24.04
+            family: linux
+          - name: Linux arm64
+            runs_on: ubuntu-24.04-arm
+            family: linux
+          - name: macOS arm64
+            runs_on: macos-15
+            family: macos
+          - name: Windows x64 (MSYS2)
+            runs_on: windows-2022
+            family: windows-msys2
 
     steps:
       - name: Check out repository
@@ -29,29 +40,97 @@ jobs:
         with:
           path: c-libp2p
 
-      - name: Install build dependencies
+      - name: Set up MSYS2
+        if: matrix.family == 'windows-msys2'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libuv
+            mingw-w64-ucrt-x86_64-libsodium
+            mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-protobuf
+            mingw-w64-ucrt-x86_64-protobuf-c
+
+      - name: Install Linux build dependencies
+        if: matrix.family == 'linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             cmake \
+            ninja-build \
             libprotobuf-c-dev \
             libsodium-dev \
             libssl-dev \
             libuv1-dev \
             pkg-config \
             protobuf-c-compiler
+        shell: bash
+        working-directory: c-libp2p
+
+      - name: Install macOS build dependencies
+        if: matrix.family == 'macos'
+        run: |
+          brew install cmake ninja libuv libsodium openssl@3 pkgconf protobuf protobuf-c
+          echo "OPENSSL_ROOT_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "CMAKE_PREFIX_PATH=$(brew --prefix libuv);$(brew --prefix libsodium);$(brew --prefix protobuf-c);$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+          echo "$(brew --prefix protobuf)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix protobuf-c)/bin" >> "$GITHUB_PATH"
+        shell: bash
+        working-directory: c-libp2p
 
       - name: Configure
+        if: matrix.family != 'windows-msys2'
         run: |
           cmake -B build \
+            -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DLP2P_BUILD_EXAMPLES=OFF \
             -DLP2P_BUILD_TESTS=ON \
             -DLP2P_ENABLE_QUIC=OFF
+        shell: bash
+        working-directory: c-libp2p
+
+      - name: Configure (MSYS2)
+        if: matrix.family == 'windows-msys2'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLP2P_BUILD_EXAMPLES=OFF \
+            -DLP2P_BUILD_TESTS=ON \
+            -DLP2P_ENABLE_QUIC=OFF \
+            -DPROTOC_EXECUTABLE="$(cygpath -m /ucrt64/bin/protoc.exe)" \
+            -DPROTOC_GEN_C="$(cygpath -m /ucrt64/bin/protoc-gen-c.exe)"
+        shell: "msys2 {0}"
+        working-directory: c-libp2p
 
       - name: Build
-        run: cmake --build build --parallel "$(nproc)"
+        if: matrix.family != 'windows-msys2'
+        shell: bash
+        working-directory: c-libp2p
+        run: cmake --build build --parallel
+
+      - name: Build (MSYS2)
+        if: matrix.family == 'windows-msys2'
+        shell: "msys2 {0}"
+        working-directory: c-libp2p
+        run: cmake --build build --parallel
 
       - name: Run tests
+        if: matrix.family != 'windows-msys2'
+        shell: bash
+        working-directory: c-libp2p
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Run tests (MSYS2)
+        if: matrix.family == 'windows-msys2'
+        shell: "msys2 {0}"
+        working-directory: c-libp2p
         run: ctest --test-dir build --output-on-failure

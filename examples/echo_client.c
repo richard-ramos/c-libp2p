@@ -24,11 +24,25 @@ typedef struct {
 
 static void echo_start_timer_cb(uv_timer_t *handle);
 static void echo_start_timer_close_cb(uv_handle_t *handle);
+static void echo_close_timer_cb(uv_timer_t *handle);
+static void echo_close_timer_close_cb(uv_handle_t *handle);
 static void echo_on_stream(lp2p_stream_t *stream, lp2p_err_t err, void *userdata);
 static void echo_on_write(lp2p_stream_t *stream, lp2p_err_t err, void *userdata);
 static void echo_on_read(lp2p_stream_t *stream, lp2p_err_t err,
                          const lp2p_buf_t *buf, void *userdata);
 static void echo_finish(echo_ctx_t *ctx);
+
+static void echo_schedule_host_close(void)
+{
+    uv_timer_t *timer = malloc(sizeof(*timer));
+    if (!timer) {
+        lp2p_host_close(g_host, NULL, NULL);
+        return;
+    }
+
+    uv_timer_init(uv_default_loop(), timer);
+    uv_timer_start(timer, echo_close_timer_cb, 0, 0);
+}
 
 static void echo_finish(echo_ctx_t *ctx)
 {
@@ -36,7 +50,7 @@ static void echo_finish(echo_ctx_t *ctx)
     free(ctx->reply);
     free(ctx->message);
     free(ctx);
-    lp2p_host_close(g_host, NULL, NULL);
+    echo_schedule_host_close();
 }
 
 static void echo_on_read(lp2p_stream_t *stream, lp2p_err_t err,
@@ -135,6 +149,18 @@ static void echo_start_timer_cb(uv_timer_t *handle)
 }
 
 static void echo_start_timer_close_cb(uv_handle_t *handle)
+{
+    free(handle);
+}
+
+static void echo_close_timer_cb(uv_timer_t *handle)
+{
+    uv_timer_stop(handle);
+    uv_close((uv_handle_t *)handle, echo_close_timer_close_cb);
+    lp2p_host_close(g_host, NULL, NULL);
+}
+
+static void echo_close_timer_close_cb(uv_handle_t *handle)
 {
     free(handle);
 }

@@ -130,7 +130,6 @@ static void ping_initiator_on_echo(lp2p_stream_t *stream, lp2p_err_t err,
     uint64_t end_time = uv_hrtime();
     uint64_t rtt_us = (end_time - ctx->start_time) / 1000;
 
-    /* Close stream gracefully */
     lp2p_stream_close(stream, NULL, NULL);
 
     if (ctx->cb) ctx->cb(LP2P_OK, rtt_us, ctx->userdata);

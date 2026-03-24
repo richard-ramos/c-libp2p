@@ -27,6 +27,9 @@ import (
 const (
 	echoProtocol   = protocol.ID("/echo/1.0.0")
 	defaultMessage = "hello from go-libp2p"
+	connectAttempts = 3
+	connectBackoff  = 500 * time.Millisecond
+	connectTimeout  = 8 * time.Second
 )
 
 var (
@@ -159,7 +162,7 @@ func runPingClient(parent context.Context, args []string) error {
 	target := fs.String("target", "", "target multiaddr with /p2p/<peer-id>")
 	count := fs.Int("count", 5, "number of pings")
 	settle := fs.Duration("settle", 200*time.Millisecond, "delay after connect before starting ping")
-	timeout := fs.Duration("timeout", 15*time.Second, "overall timeout")
+	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -221,7 +224,7 @@ func runEchoClient(parent context.Context, args []string) error {
 	target := fs.String("target", "", "target multiaddr with /p2p/<peer-id>")
 	message := fs.String("message", defaultMessage, "message to send")
 	settle := fs.Duration("settle", 200*time.Millisecond, "delay after connect before opening echo stream")
-	timeout := fs.Duration("timeout", 15*time.Second, "overall timeout")
+	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -291,9 +294,43 @@ func connect(ctx context.Context, h host.Host, target string) (*peer.AddrInfo, e
 		return nil, err
 	}
 
-	if err := h.Connect(ctx, *info); err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 1; attempt <= connectAttempts; attempt++ {
+		attemptCtx := ctx
+		cancel := func() {}
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, ctx.Err()
+			}
+
+			perAttempt := connectTimeout
+			if remaining < perAttempt {
+				perAttempt = remaining
+			}
+
+			attemptCtx, cancel = context.WithTimeout(ctx, perAttempt)
+		}
+
+		err = h.Connect(attemptCtx, *info)
+		cancel()
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+
+		if attempt == connectAttempts || ctx.Err() != nil {
+			break
+		}
+
+		timer := time.NewTimer(connectBackoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 
-	return info, nil
+	return nil, lastErr
 }

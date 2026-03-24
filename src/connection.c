@@ -65,15 +65,31 @@ static void conn_async_cb(uv_async_t *handle) {
     }
 }
 
-static void conn_defer(lp2p_conn_t *conn, conn_deferred_fn fn, void *arg) {
+bool lp2p_conn_defer(lp2p_conn_t *conn, conn_deferred_fn fn, void *arg,
+                     conn_deferred_cleanup_fn cleanup) {
+    if (!conn || !fn) {
+        if (cleanup) cleanup(arg);
+        return false;
+    }
+
     conn_deferred_t *d = calloc(1, sizeof(*d));
-    if (!d) return;
+    if (!d) {
+        if (cleanup) cleanup(arg);
+        return false;
+    }
+
     d->fn = fn;
     d->arg = arg;
+    d->cleanup = cleanup;
     lp2p_list_push_back(&conn->deferred_queue, &d->node);
     if (conn->async_initialized) {
         uv_async_send(&conn->async_handle);
     }
+    return true;
+}
+
+static void conn_defer(lp2p_conn_t *conn, conn_deferred_fn fn, void *arg) {
+    lp2p_conn_defer(conn, fn, arg, NULL);
 }
 
 /* ── Helper: deferred ready callback ──────────────────────────────────────── */
@@ -238,6 +254,9 @@ void lp2p_conn_free(lp2p_conn_t *conn) {
     while (!lp2p_list_empty(&conn->deferred_queue)) {
         lp2p_list_node_t *n = lp2p_list_pop_front(&conn->deferred_queue);
         conn_deferred_t *d = lp2p_container_of(n, conn_deferred_t, node);
+        if (d->cleanup) {
+            d->cleanup(d->arg);
+        }
         free(d);
     }
 
